@@ -103,11 +103,24 @@ def create_room(args: argparse.Namespace) -> None:
             "created_at": round(time.time(), 3),
             "expires_at": invite.expires_at,
             "verified": False,
+            "disabled": False,
             "processed_message_ids": [],
         },
         home,
     )
-    print(json.dumps({"room_id": invite.room_id, "relay_url": invite.relay_url, "expires_at": invite.expires_at, "invite_code": invite_code, "note": "Share privately. Do not commit invite codes."}, indent=2, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "room_id": invite.room_id,
+                "relay_url": invite.relay_url,
+                "expires_at": invite.expires_at,
+                "invite_code": invite_code,
+                "note": "Share privately. Do not commit invite codes. Run room sync, compare the safety phrase by phone/email, then run room verify.",
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
 
 
 def join_room(args: argparse.Namespace) -> None:
@@ -131,6 +144,7 @@ def join_room(args: argparse.Namespace) -> None:
             "expires_at": invite.expires_at,
             "safety_phrase": phrase,
             "verified": False,
+            "disabled": False,
             "processed_message_ids": [],
         },
         home,
@@ -140,7 +154,21 @@ def join_room(args: argparse.Namespace) -> None:
         relay_token=invite.relay_token,
         envelope=create_pair_hello(room_id=invite.room_id, sender=identity, x25519_public_key=x25519_identity.public_key),
     )
-    print(json.dumps({"joined": True, "room_id": invite.room_id, "relay_url": invite.relay_url, "peer_node_id": invite.creator_node_id, "safety_phrase": phrase, "hello_posted": hello_response.get("accepted") is True}, indent=2, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "joined": True,
+                "room_id": invite.room_id,
+                "relay_url": invite.relay_url,
+                "peer_node_id": invite.creator_node_id,
+                "safety_phrase": phrase,
+                "hello_posted": hello_response.get("accepted") is True,
+                "next_step": "Compare this safety phrase with the other person, then run room verify locally.",
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
 
 
 def sync_room(args: argparse.Namespace) -> None:
@@ -175,11 +203,40 @@ def sync_room(args: argparse.Namespace) -> None:
     print(json.dumps({"room_id": room["room_id"], "peer_node_id": room.get("peer_node_id"), "safety_phrase": room.get("safety_phrase"), "message_count": len(messages), "decrypted_messages": decrypted}, indent=2, sort_keys=True))
 
 
+def verify_room(args: argparse.Namespace) -> None:
+    home = _home(args.home)
+    room = _load_room(home, args.room_id)
+    expected = str(room.get("safety_phrase") or "")
+    supplied = str(args.phrase or "").strip()
+    if not expected:
+        raise SystemExit("Room does not have a safety phrase yet. Run gremlinchat room sync first.")
+    if supplied != expected:
+        raise SystemExit("Safety phrase mismatch. Do not activate this room.")
+    if not room.get("peer_node_id") or not room.get("peer_public_key") or not room.get("peer_x25519_public_key"):
+        raise SystemExit("Room does not have complete peer identity yet. Run gremlinchat room sync first.")
+    room["verified"] = True
+    room["disabled"] = False
+    room["verified_at"] = round(time.time(), 3)
+    save_room(room, home)
+    print(json.dumps({"verified": True, "room_id": room["room_id"], "safety_phrase": expected}, indent=2, sort_keys=True))
+
+
+def disable_room(args: argparse.Namespace) -> None:
+    home = _home(args.home)
+    room = _load_room(home, args.room_id)
+    room["verified"] = False
+    room["disabled"] = True
+    room["disabled_at"] = round(time.time(), 3)
+    save_room(room, home)
+    print(json.dumps({"disabled": True, "room_id": room["room_id"]}, indent=2, sort_keys=True))
+
+
 def request_runbook(args: argparse.Namespace) -> None:
     home = _home(args.home)
     identity = load_or_create_identity(home)
     x25519_identity = load_or_create_x25519_identity(home)
     room = _load_room(home, args.room_id)
+    _require_room_verified(room)
     request = create_task_request(runbook=args.runbook, payload=json.loads(args.payload_json or "{}"))
     envelope = seal_message(room_id=room["room_id"], sender=identity, room_key=_room_key(room, identity, x25519_identity), message=request)
     response = RelayClient(room["relay_url"]).post_envelope(room_id=room["room_id"], relay_token=room["relay_token"], envelope=envelope.to_dict())
@@ -210,6 +267,7 @@ def _process_room_once(home: Path, room_id: str | None) -> dict:
     x25519_identity = load_or_create_x25519_identity(home)
     policy = load_policy(home)
     room = _load_room(home, room_id)
+    _require_room_verified(room)
     processed = set(room.get("processed_message_ids", []))
     replies = []
     for record in _fetch_room_messages(room):
@@ -311,6 +369,15 @@ def _load_room(home: Path, room_id: str | None) -> dict:
     raise SystemExit(f"Unknown GremlinChat room: {room_id}")
 
 
+def _require_room_verified(room: dict) -> None:
+    if room.get("disabled"):
+        raise SystemExit("Room is disabled. Run room verify again only after confirming consent.")
+    if not room.get("verified"):
+        raise SystemExit("Room is not verified. Compare the safety phrase with the other person, then run gremlinchat room verify --phrase <phrase>.")
+    if not room.get("peer_node_id") or not room.get("peer_public_key") or not room.get("peer_x25519_public_key"):
+        raise SystemExit("Room is missing peer identity. Run gremlinchat room sync before verification.")
+
+
 def _fetch_room_messages(room: dict) -> list[dict]:
     response = RelayClient(room["relay_url"]).messages_after(room_id=room["room_id"], relay_token=room["relay_token"], after=-1)
     if "messages" not in response:
@@ -365,6 +432,13 @@ def build_parser() -> argparse.ArgumentParser:
     room_sync = room_subcommands.add_parser("sync", help="Fetch pairing hellos and encrypted room messages")
     room_sync.add_argument("--room-id", default=None)
     room_sync.set_defaults(func=sync_room)
+    room_verify = room_subcommands.add_parser("verify", help="Activate a room after comparing the safety phrase")
+    room_verify.add_argument("--room-id", default=None)
+    room_verify.add_argument("--phrase", required=True)
+    room_verify.set_defaults(func=verify_room)
+    room_disable = room_subcommands.add_parser("disable", help="Disable a room until it is verified again")
+    room_disable.add_argument("--room-id", default=None)
+    room_disable.set_defaults(func=disable_room)
     room_request = room_subcommands.add_parser("request", help="Send an encrypted runbook request")
     room_request.add_argument("--room-id", default=None)
     room_request.add_argument("--runbook", required=True)
@@ -415,4 +489,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

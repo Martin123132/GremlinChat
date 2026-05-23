@@ -40,6 +40,7 @@ Join from the other machine:
 
 ```powershell
 gremlinchat room join GC1:...
+gremlinchat room verify --phrase WORD-WORD-WORD-WORD
 gremlinchat room loop
 ```
 
@@ -47,6 +48,7 @@ Request a safe proof:
 
 ```powershell
 gremlinchat room sync
+gremlinchat room verify --phrase WORD-WORD-WORD-WORD
 gremlinchat room request --runbook presence.ping
 gremlinchat room sync
 ```
@@ -84,6 +86,14 @@ Use this to stop all remote requests immediately:
 ```powershell
 gremlinchat emergency-stop
 ```
+
+Disable one room without deleting it:
+
+```powershell
+gremlinchat room disable
+```
+
+Rooms cannot send or process encrypted runbook requests until the local owner runs `room verify` with the exact safety phrase shown by both machines.
 
 Pending approvals:
 

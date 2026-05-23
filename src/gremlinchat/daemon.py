@@ -90,9 +90,9 @@ def _render_dashboard(snapshot: dict[str, Any]) -> str:
     policy = snapshot["policy"]
     pending = [approval for approval in snapshot["approvals"] if approval.get("status") == "pending"]
     room_rows = "\n".join(
-        f"<tr><td><code>{html.escape(str(room.get('room_id', '')))}</code></td><td>{html.escape(str(room.get('relay_url', '')))}</td><td><code>{html.escape(str(room.get('peer_node_id', 'pending')))}</code></td><td>{html.escape(str(room.get('safety_phrase', 'not verified')))}</td></tr>"
+        f"<tr><td><code>{html.escape(str(room.get('room_id', '')))}</code></td><td>{html.escape(str(room.get('relay_url', '')))}</td><td><code>{html.escape(str(room.get('peer_node_id', 'pending')))}</code></td><td>{html.escape(_room_state(room))}</td><td>{html.escape(str(room.get('safety_phrase', 'not ready')))}</td></tr>"
         for room in snapshot["rooms"]
-    ) or "<tr><td colspan=\"4\" class=\"empty\">No paired rooms yet.</td></tr>"
+    ) or "<tr><td colspan=\"5\" class=\"empty\">No paired rooms yet.</td></tr>"
     approval_rows = "\n".join(
         f"<tr><td><code>{html.escape(str(approval.get('approval_id', '')))}</code></td><td>{html.escape(str(approval.get('runbook', '')))}</td><td>{html.escape(str(approval.get('reason', '')))}</td><td><form method=\"post\" action=\"/api/approvals/approve?approval_id={html.escape(str(approval.get('approval_id', '')))}\"><button>Approve</button></form><form method=\"post\" action=\"/api/approvals/reject?approval_id={html.escape(str(approval.get('approval_id', '')))}\"><button>Reject</button></form></td></tr>"
         for approval in pending
@@ -140,12 +140,20 @@ def _render_dashboard(snapshot: dict[str, Any]) -> str:
       <div class="metric"><span>Pending Approvals</span><strong>{len(pending)}</strong></div>
       <div class="metric"><span>Write Runbooks</span><strong>{len(policy["enabled_write_runbooks"])}</strong></div>
     </div>
-    <section><h2>Rooms</h2><table><thead><tr><th>Room</th><th>Relay</th><th>Partner</th><th>Safety Phrase</th></tr></thead><tbody>{room_rows}</tbody></table></section>
+    <section><h2>Rooms</h2><table><thead><tr><th>Room</th><th>Relay</th><th>Partner</th><th>State</th><th>Safety Phrase</th></tr></thead><tbody>{room_rows}</tbody></table></section>
     <section><h2>Pending Approvals</h2><table><thead><tr><th>Approval</th><th>Runbook</th><th>Reason</th><th>Decision</th></tr></thead><tbody>{approval_rows}</tbody></table></section>
     <section><h2>Audit</h2><table><thead><tr><th>Time</th><th>Event</th><th>Runbook</th><th>Summary</th></tr></thead><tbody>{audit_rows}</tbody></table></section>
   </main>
 </body>
 </html>"""
+
+
+def _room_state(room: dict[str, Any]) -> str:
+    if room.get("disabled"):
+        return "disabled"
+    if room.get("verified"):
+        return "verified"
+    return "not verified"
 
 
 def _html_response(handler: BaseHTTPRequestHandler, status: int, markup: str) -> None:
@@ -164,4 +172,3 @@ def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[s
     handler.send_header("Content-Length", str(len(body)))
     handler.end_headers()
     handler.wfile.write(body)
-
