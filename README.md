@@ -152,6 +152,8 @@ Dashboard URL:
 http://127.0.0.1:8777/dashboard
 ```
 
+Dashboard buttons use a local CSRF token, so state-changing dashboard requests must come from the dashboard page itself.
+
 ## Runbooks
 
 Read-only runbooks can run automatically:

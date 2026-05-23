@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -146,6 +147,19 @@ def load_policy(home: Path | None = None) -> RunbookPolicy:
 def save_policy(policy: RunbookPolicy, home: Path | None = None) -> None:
     resolved = ensure_home(home)
     (resolved / "runbook-policy.json").write_text(json.dumps(policy.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
+
+
+def load_or_create_dashboard_token(home: Path | None = None) -> str:
+    resolved = ensure_home(home)
+    path = resolved / "dashboard-token.json"
+    if path.exists():
+        return str(json.loads(path.read_text(encoding="utf-8"))["csrf_token"])
+    token = secrets.token_urlsafe(32)
+    path.write_text(
+        json.dumps({"schema": "gremlinchat.dashboard-token.v1", "csrf_token": token, "created_at": round(time.time(), 3)}, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return token
 
 
 def load_rooms(home: Path | None = None) -> list[dict[str, Any]]:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import json
+import secrets
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -12,7 +13,7 @@ from urllib.parse import parse_qs, quote, urlparse
 
 from .roomops import GremlinChatError, disable_room, process_room_once, request_runbook, revoke_room, sync_room_messages
 from .runbooks import runbook_catalog
-from .store import decide_approval, load_approvals, load_or_create_identity, load_policy, load_rooms, read_audit_events, save_policy
+from .store import decide_approval, load_approvals, load_or_create_dashboard_token, load_or_create_identity, load_policy, load_rooms, read_audit_events, save_policy
 from .trial import RESET_CONFIRMATION, build_trial_checklist, reset_local_trial, trial_status, write_trial_bundle
 
 
@@ -27,7 +28,7 @@ def create_daemon_http_server(home: Path, host: str = "127.0.0.1", port: int = 8
             parsed = urlparse(self.path)
             if parsed.path in {"/", "/dashboard"}:
                 with lock:
-                    _html_response(self, 200, _render_dashboard(_snapshot(home)))
+                    _html_response(self, 200, _render_dashboard(_snapshot(home, include_csrf=True)))
                 return
             if parsed.path == "/api/status":
                 with lock:
@@ -51,6 +52,9 @@ def create_daemon_http_server(home: Path, host: str = "127.0.0.1", port: int = 8
 
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
+            if not _csrf_valid(home, parsed):
+                _json_response(self, 403, {"ok": False, "error": "dashboard CSRF token rejected"})
+                return
             if parsed.path == "/api/emergency-stop":
                 with lock:
                     policy = load_policy(home)
@@ -116,10 +120,10 @@ def create_daemon_http_server(home: Path, host: str = "127.0.0.1", port: int = 8
     return ThreadingHTTPServer((host, port), DaemonHandler)
 
 
-def _snapshot(home: Path) -> dict[str, Any]:
+def _snapshot(home: Path, *, include_csrf: bool = False) -> dict[str, Any]:
     identity = load_or_create_identity(home)
     policy = load_policy(home)
-    return {
+    snapshot = {
         "product": "GremlinChat",
         "node_id": identity.node_id,
         "home": str(home),
@@ -129,6 +133,9 @@ def _snapshot(home: Path) -> dict[str, Any]:
         "audit": read_audit_events(home, limit=25),
         "trial": trial_status(home),
     }
+    if include_csrf:
+        snapshot["csrf_token"] = load_or_create_dashboard_token(home)
+    return snapshot
 
 
 def _room_summary(room: dict[str, Any]) -> dict[str, Any]:
@@ -142,13 +149,14 @@ def _room_summary(room: dict[str, Any]) -> dict[str, Any]:
 def _render_dashboard(snapshot: dict[str, Any]) -> str:
     node_id = html.escape(snapshot["node_id"])
     home = html.escape(snapshot["home"])
+    csrf = quote(str(snapshot.get("csrf_token", "")), safe="")
     policy = snapshot["policy"]
     pending = [approval for approval in snapshot["approvals"] if approval.get("status") == "pending"]
-    room_rows = "\n".join(_room_row(room) for room in snapshot["rooms"]) or "<tr><td colspan=\"6\" class=\"empty\">No paired rooms yet.</td></tr>"
+    room_rows = "\n".join(_room_row(room, csrf) for room in snapshot["rooms"]) or "<tr><td colspan=\"6\" class=\"empty\">No paired rooms yet.</td></tr>"
     trial = snapshot["trial"]
     trial_rows = _trial_rows(trial)
     approval_rows = "\n".join(
-        f"<tr><td><code>{html.escape(str(approval.get('approval_id', '')))}</code></td><td>{html.escape(str(approval.get('runbook', '')))}</td><td>{html.escape(str(approval.get('reason', '')))}</td><td><form method=\"post\" action=\"/api/approvals/approve?approval_id={quote(str(approval.get('approval_id', '')), safe='')}&redirect=1\"><button>Approve</button></form><form method=\"post\" action=\"/api/approvals/reject?approval_id={quote(str(approval.get('approval_id', '')), safe='')}&redirect=1\"><button>Reject</button></form></td></tr>"
+        f"<tr><td><code>{html.escape(str(approval.get('approval_id', '')))}</code></td><td>{html.escape(str(approval.get('runbook', '')))}</td><td>{html.escape(str(approval.get('reason', '')))}</td><td><form method=\"post\" action=\"/api/approvals/approve?approval_id={quote(str(approval.get('approval_id', '')), safe='')}&redirect=1&csrf={csrf}\"><button>Approve</button></form><form method=\"post\" action=\"/api/approvals/reject?approval_id={quote(str(approval.get('approval_id', '')), safe='')}&redirect=1&csrf={csrf}\"><button>Reject</button></form></td></tr>"
         for approval in pending
     ) or "<tr><td colspan=\"4\" class=\"empty\">No pending approvals.</td></tr>"
     audit_rows = "\n".join(
@@ -191,12 +199,12 @@ def _render_dashboard(snapshot: dict[str, Any]) -> str:
   <header><h1>GremlinChat</h1><div class="subhead">Local control room for <code>{node_id}</code>. Home: <code>{home}</code>.</div></header>
   <main>
     <div class="metrics">
-      <div class="metric"><span>Emergency Stop</span><strong><span class="state">{html.escape(emergency)}</span></strong><form method="post" action="/api/emergency-stop?redirect=1"><button>Emergency Stop</button></form></div>
+      <div class="metric"><span>Emergency Stop</span><strong><span class="state">{html.escape(emergency)}</span></strong><form method="post" action="/api/emergency-stop?redirect=1&csrf={csrf}"><button>Emergency Stop</button></form></div>
       <div class="metric"><span>Rooms</span><strong>{len(snapshot["rooms"])}</strong></div>
       <div class="metric"><span>Pending Approvals</span><strong>{len(pending)}</strong></div>
       <div class="metric"><span>Write Runbooks</span><strong>{len(policy["enabled_write_runbooks"])}</strong></div>
     </div>
-    <section><h2>Trial</h2><table><thead><tr><th>Check</th><th>Status</th><th>Detail</th></tr></thead><tbody>{trial_rows}</tbody></table><div class="actions"><a href="/api/trial/checklist?role=host">Checklist</a><form method="post" action="/api/trial/bundle?redirect=1"><button>Bundle</button></form><form method="post" action="/api/emergency-stop?redirect=1"><button>Emergency Stop</button></form></div></section>
+    <section><h2>Trial</h2><table><thead><tr><th>Check</th><th>Status</th><th>Detail</th></tr></thead><tbody>{trial_rows}</tbody></table><div class="actions"><a href="/api/trial/checklist?role=host">Checklist</a><form method="post" action="/api/trial/bundle?redirect=1&csrf={csrf}"><button>Bundle</button></form><form method="post" action="/api/emergency-stop?redirect=1&csrf={csrf}"><button>Emergency Stop</button></form></div></section>
     <section><h2>Rooms</h2><table><thead><tr><th>Room</th><th>Relay</th><th>Partner</th><th>State</th><th>Safety Phrase</th><th>Actions</th></tr></thead><tbody>{room_rows}</tbody></table></section>
     <section><h2>Pending Approvals</h2><table><thead><tr><th>Approval</th><th>Runbook</th><th>Reason</th><th>Decision</th></tr></thead><tbody>{approval_rows}</tbody></table></section>
     <section><h2>Audit</h2><table><thead><tr><th>Time</th><th>Event</th><th>Runbook</th><th>Summary</th></tr></thead><tbody>{audit_rows}</tbody></table></section>
@@ -220,16 +228,16 @@ def _trial_rows(trial: dict[str, Any]) -> str:
     )
 
 
-def _room_row(room: dict[str, Any]) -> str:
+def _room_row(room: dict[str, Any], csrf: str) -> str:
     room_id = str(room.get("room_id", ""))
     room_id_q = quote(room_id, safe="")
     actions = " ".join(
         [
-            f"<form method=\"post\" action=\"/api/rooms/sync?room_id={room_id_q}&redirect=1\"><button>Sync</button></form>",
-            f"<form method=\"post\" action=\"/api/rooms/request?room_id={room_id_q}&runbook=presence.ping&redirect=1\"><button>Ping</button></form>",
-            f"<form method=\"post\" action=\"/api/rooms/request?room_id={room_id_q}&runbook=gremlinchat.doctor&redirect=1\"><button>Doctor</button></form>",
-            f"<form method=\"post\" action=\"/api/rooms/disable?room_id={room_id_q}&redirect=1\"><button>Disable</button></form>",
-            f"<form method=\"post\" action=\"/api/rooms/revoke?room_id={room_id_q}&redirect=1\"><button>Revoke</button></form>",
+            f"<form method=\"post\" action=\"/api/rooms/sync?room_id={room_id_q}&redirect=1&csrf={csrf}\"><button>Sync</button></form>",
+            f"<form method=\"post\" action=\"/api/rooms/request?room_id={room_id_q}&runbook=presence.ping&redirect=1&csrf={csrf}\"><button>Ping</button></form>",
+            f"<form method=\"post\" action=\"/api/rooms/request?room_id={room_id_q}&runbook=gremlinchat.doctor&redirect=1&csrf={csrf}\"><button>Doctor</button></form>",
+            f"<form method=\"post\" action=\"/api/rooms/disable?room_id={room_id_q}&redirect=1&csrf={csrf}\"><button>Disable</button></form>",
+            f"<form method=\"post\" action=\"/api/rooms/revoke?room_id={room_id_q}&redirect=1&csrf={csrf}\"><button>Revoke</button></form>",
         ]
     )
     return (
@@ -266,6 +274,12 @@ def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[s
     handler.send_header("Content-Length", str(len(body)))
     handler.end_headers()
     handler.wfile.write(body)
+
+
+def _csrf_valid(home: Path, parsed: Any) -> bool:
+    supplied = parse_qs(parsed.query).get("csrf", [""])[0]
+    expected = load_or_create_dashboard_token(home)
+    return bool(supplied) and secrets.compare_digest(supplied, expected)
 
 
 def _action_response(handler: BaseHTTPRequestHandler, parsed: Any, payload: dict[str, Any]) -> None:

@@ -1,12 +1,15 @@
 import json
 import threading
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+
+import pytest
 
 from gremlinchat.crypto import NodeIdentity, X25519Identity
 from gremlinchat.daemon import create_daemon_http_server
 from gremlinchat.relay import create_relay_http_server
 from gremlinchat.roomops import sync_room_messages, verify_room
-from gremlinchat.store import ApprovedRepo, load_approvals, load_or_create_identity, load_policy, load_rooms, save_approvals, save_policy, save_room
+from gremlinchat.store import ApprovedRepo, load_approvals, load_or_create_dashboard_token, load_or_create_identity, load_policy, load_rooms, save_approvals, save_policy, save_room
 from gremlinchat.trial import (
     RESET_CONFIRMATION,
     accept_trial_invite,
@@ -31,6 +34,11 @@ def _post_json(url):
 def _get_json(url):
     with urlopen(url, timeout=5) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def _csrf_url(home, url):
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}csrf={load_or_create_dashboard_token(home)}"
 
 
 def _trial_room(peer=None, peer_x=None, *, verified=False, disabled=False):
@@ -231,14 +239,17 @@ def test_dashboard_revoke_and_emergency_stop_posts(tmp_path):
     thread.start()
     host, port = server.server_address
     try:
-        revoke = _post_json(f"http://{host}:{port}/api/rooms/revoke?room_id=room_dashboard")
-        stop = _post_json(f"http://{host}:{port}/api/emergency-stop")
+        with pytest.raises(HTTPError) as exc_info:
+            _post_json(f"http://{host}:{port}/api/emergency-stop")
+        revoke = _post_json(_csrf_url(tmp_path, f"http://{host}:{port}/api/rooms/revoke?room_id=room_dashboard"))
+        stop = _post_json(_csrf_url(tmp_path, f"http://{host}:{port}/api/emergency-stop"))
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
 
     policy = load_policy(tmp_path)
+    assert exc_info.value.code == 403
     assert revoke["ok"] is True
     assert stop["ok"] is True
     assert peer.node_id in policy.revoked_node_ids
@@ -256,14 +267,16 @@ def test_dashboard_trial_status_bundle_and_reset_apis(tmp_path):
     thread.start()
     host, port = server.server_address
     try:
+        public_status = _get_json(f"http://{host}:{port}/api/status")
         status = _get_json(f"http://{host}:{port}/api/trial/status")
-        bundle = _post_json(f"http://{host}:{port}/api/trial/bundle")
-        reset = _post_json(f"http://{host}:{port}/api/trial/reset-local?confirm={RESET_CONFIRMATION}")
+        bundle = _post_json(_csrf_url(tmp_path, f"http://{host}:{port}/api/trial/bundle"))
+        reset = _post_json(_csrf_url(tmp_path, f"http://{host}:{port}/api/trial/reset-local?confirm={RESET_CONFIRMATION}"))
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
 
+    assert "csrf_token" not in public_status
     assert status["schema"] == "gremlinchat.trial-status.v1"
     assert bundle["ok"] is True
     assert "bundle_paths" in bundle
