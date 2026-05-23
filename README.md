@@ -63,6 +63,8 @@ Host relay on one trusted machine:
 gremlinchat relay serve --host YOUR_LAN_OR_TAILSCALE_IP --port 8778 --state-dir "$env:LOCALAPPDATA\GremlinChat\relay"
 ```
 
+The relay is deliberately small and capped: it rejects oversized request bodies, oversized encrypted envelopes, and rooms that exceed the configured message limit. The defaults are intended for status/proof traffic, not file transfer.
+
 Check readiness:
 
 ```powershell
@@ -90,7 +92,7 @@ gremlinchat room verify --phrase WORD-WORD-WORD-WORD
 Guest keeps their machine listening for read-only proof requests:
 
 ```powershell
-gremlinchat room loop
+gremlinchat trial listen
 ```
 
 Host runs the read-only proof and writes a redacted report:
@@ -98,6 +100,8 @@ Host runs the read-only proof and writes a redacted report:
 ```powershell
 gremlinchat trial prove
 ```
+
+`trial listen` exists for the first trial because it always enforces the read-only trial lock before processing partner requests. Use `room loop` only when you deliberately want the lower-level room processor.
 
 Run a one-machine proof before involving another person:
 

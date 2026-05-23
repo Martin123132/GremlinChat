@@ -18,6 +18,14 @@ def _start_relay():
     return server, thread, RelayClient(f"http://{host}:{port}")
 
 
+def _start_relay_with_limits(**limits):
+    server = create_relay_http_server(host="127.0.0.1", port=0, **limits)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    return server, thread, RelayClient(f"http://{host}:{port}")
+
+
 def _stop(server, thread):
     server.shutdown()
     server.server_close()
@@ -69,6 +77,30 @@ def test_relay_persists_room_messages(tmp_path):
     restored = GremlinRelay(state_dir=tmp_path)
     messages = restored.messages_after(room.room_id, room.token)
     assert messages["messages"][0]["envelope"]["sender_node_id"] == alice.node_id
+
+
+def test_relay_rejects_room_message_flood():
+    relay = GremlinRelay(max_messages_per_room=1)
+    room = relay.create_room(ttl_seconds=60)
+    alice = NodeIdentity.generate()
+    first = _envelope(alice)
+    first["room_id"] = room.room_id
+    second = _envelope(alice)
+    second["room_id"] = room.room_id
+
+    assert relay.append_envelope(room.room_id, room.token, first)["accepted"]
+    with pytest.raises(PermissionError, match="message limit"):
+        relay.append_envelope(room.room_id, room.token, second)
+
+
+def test_relay_rejects_oversized_request_body():
+    server, thread, client = _start_relay_with_limits(max_body_bytes=8)
+    try:
+        rejected = client.create_room(ttl_seconds=60)
+        assert rejected["http_status"] == 413
+        assert "exceeds" in rejected["error"]
+    finally:
+        _stop(server, thread)
 
 
 def test_runbooks_reject_arbitrary_commands_and_path_escape(tmp_path):

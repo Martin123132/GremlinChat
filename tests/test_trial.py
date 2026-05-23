@@ -5,9 +5,9 @@ from urllib.request import Request, urlopen
 from gremlinchat.crypto import NodeIdentity, X25519Identity
 from gremlinchat.daemon import create_daemon_http_server
 from gremlinchat.relay import create_relay_http_server
-from gremlinchat.roomops import process_room_once, sync_room_messages, verify_room
-from gremlinchat.store import load_policy, save_room
-from gremlinchat.trial import accept_trial_invite, create_trial_invite, run_live_read_only_proof, run_trial_simulation, write_trial_report
+from gremlinchat.roomops import sync_room_messages, verify_room
+from gremlinchat.store import load_policy, save_policy, save_room
+from gremlinchat.trial import accept_trial_invite, create_trial_invite, enforce_trial_read_only_lock, listen_once, run_live_read_only_proof, run_trial_simulation, write_trial_report
 
 
 def _post_json(url):
@@ -61,7 +61,7 @@ def test_live_trial_host_guest_and_proof(tmp_path):
             timeout_seconds=3,
             poll_interval=0,
             write_report=False,
-            process_once=lambda: process_room_once(bob_home, host_packet["room_id"]),
+            process_once=lambda: listen_once(bob_home, room_id=host_packet["room_id"]),
         )
     finally:
         server.shutdown()
@@ -71,6 +71,18 @@ def test_live_trial_host_guest_and_proof(tmp_path):
     assert proof["ok"] is True
     assert {item["runbook"] for item in proof["runbook_results"]} == {"presence.ping", "machine.status", "gremlinchat.doctor"}
     assert all(item["result_accepted"] for item in proof["runbook_results"])
+
+
+def test_trial_listener_enforces_read_only_lock(tmp_path):
+    policy = load_policy(tmp_path)
+    policy.trial_read_only_lock = False
+    save_policy(policy, tmp_path)
+
+    result = enforce_trial_read_only_lock(tmp_path)
+    updated = load_policy(tmp_path)
+
+    assert result == {"trial_read_only_lock": True, "changed": True}
+    assert updated.trial_read_only_lock is True
 
 
 def test_dashboard_revoke_and_emergency_stop_posts(tmp_path):

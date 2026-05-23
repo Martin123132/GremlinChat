@@ -30,6 +30,7 @@ from .store import (
     load_policy,
     load_rooms,
     read_audit_events,
+    save_policy,
     save_room,
 )
 
@@ -79,7 +80,7 @@ def create_trial_invite(home: Path, *, relay_url: str, ttl_seconds: int = 600) -
             "Share the invite code privately.",
             "Ask the guest to run gremlinchat trial guest GC1:...",
             "Run gremlinchat room sync, compare the safety phrase out of band, then run gremlinchat room verify --phrase <phrase>.",
-            "After both sides verify, ask the guest to run gremlinchat room loop and run gremlinchat trial prove.",
+            "After both sides verify, ask the guest to run gremlinchat trial listen and run gremlinchat trial prove.",
         ],
     }
     append_audit_event(home, {"event_type": "trial.host_invite_created", "room_id": invite.room_id, "relay_url": invite.relay_url, "expires_at": invite.expires_at})
@@ -128,7 +129,7 @@ def accept_trial_invite(home: Path, code: str) -> dict[str, Any]:
         "next_steps": [
             "Compare this safety phrase with the host out of band.",
             "Run gremlinchat room verify --phrase <phrase> only if both sides match.",
-            "After both sides verify, run gremlinchat room loop so the host can run gremlinchat trial prove.",
+            "After both sides verify, run gremlinchat trial listen so the host can run gremlinchat trial prove.",
         ],
     }
     append_audit_event(home, {"event_type": "trial.guest_invite_accepted", "room_id": invite.room_id, "peer_node_id": invite.creator_node_id, "hello_response": hello_response})
@@ -196,6 +197,24 @@ def run_live_read_only_proof(
         report["report_paths"] = write_trial_report(home, report)
     append_audit_event(home, {"event_type": "trial.live_readonly_proof", "ok": ok, "runbook_results": runbook_results})
     return report
+
+
+def enforce_trial_read_only_lock(home: Path) -> dict[str, Any]:
+    home = ensure_home(home)
+    policy = load_policy(home)
+    changed = False
+    if not policy.trial_read_only_lock:
+        policy.trial_read_only_lock = True
+        save_policy(policy, home)
+        changed = True
+        append_audit_event(home, {"event_type": "trial.read_only_lock_enabled"})
+    return {"trial_read_only_lock": True, "changed": changed}
+
+
+def listen_once(home: Path, *, room_id: str | None = None) -> dict[str, Any]:
+    lock = enforce_trial_read_only_lock(home)
+    processed = process_room_once(home, room_id)
+    return {"read_only_lock": lock, **processed}
 
 
 def run_preflight(

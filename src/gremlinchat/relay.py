@@ -16,6 +16,11 @@ from urllib.error import HTTPError
 from urllib.parse import parse_qs, quote, urlparse
 from urllib.request import Request, urlopen
 
+DEFAULT_MAX_BODY_BYTES = 256 * 1024
+DEFAULT_MAX_ENVELOPE_BYTES = 128 * 1024
+DEFAULT_MAX_MESSAGES_PER_ROOM = 1000
+MAX_REJECT_DRAIN_BYTES = 1024 * 1024
+
 
 @dataclass
 class RelayRoom:
@@ -28,8 +33,16 @@ class RelayRoom:
 
 
 class GremlinRelay:
-    def __init__(self, state_dir: str | Path | None = None):
+    def __init__(
+        self,
+        state_dir: str | Path | None = None,
+        *,
+        max_messages_per_room: int = DEFAULT_MAX_MESSAGES_PER_ROOM,
+        max_envelope_bytes: int = DEFAULT_MAX_ENVELOPE_BYTES,
+    ):
         self.rooms: dict[str, RelayRoom] = {}
+        self.max_messages_per_room = max_messages_per_room
+        self.max_envelope_bytes = max_envelope_bytes
         self.state_dir = None if state_dir is None else Path(state_dir).expanduser().resolve()
         self.db_path = None if self.state_dir is None else self.state_dir / "relay.sqlite3"
         if self.db_path is not None:
@@ -58,6 +71,11 @@ class GremlinRelay:
         sender = str(envelope.get("sender_node_id", ""))
         if not sender:
             raise ValueError("envelope missing sender_node_id")
+        envelope_size = len(json.dumps(envelope, sort_keys=True).encode("utf-8"))
+        if envelope_size > self.max_envelope_bytes:
+            raise RelayPayloadTooLarge(f"envelope exceeds {self.max_envelope_bytes} bytes")
+        if len(room.messages) >= self.max_messages_per_room:
+            raise PermissionError("room message limit reached")
         if sender not in room.participants:
             if room.locked or len(room.participants) >= 2:
                 raise PermissionError("room is locked to its existing participants")
@@ -142,8 +160,21 @@ class GremlinRelay:
             db.commit()
 
 
-def create_relay_http_server(relay: GremlinRelay | None = None, host: str = "127.0.0.1", port: int = 8778, state_dir: str | Path | None = None) -> ThreadingHTTPServer:
-    relay = GremlinRelay(state_dir=state_dir) if relay is None else relay
+class RelayPayloadTooLarge(ValueError):
+    """Raised when a relay request is too large for the configured limits."""
+
+
+def create_relay_http_server(
+    relay: GremlinRelay | None = None,
+    host: str = "127.0.0.1",
+    port: int = 8778,
+    state_dir: str | Path | None = None,
+    *,
+    max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
+    max_messages_per_room: int = DEFAULT_MAX_MESSAGES_PER_ROOM,
+    max_envelope_bytes: int = DEFAULT_MAX_ENVELOPE_BYTES,
+) -> ThreadingHTTPServer:
+    relay = GremlinRelay(state_dir=state_dir, max_messages_per_room=max_messages_per_room, max_envelope_bytes=max_envelope_bytes) if relay is None else relay
     lock = threading.Lock()
 
     class RelayHandler(BaseHTTPRequestHandler):
@@ -153,14 +184,14 @@ def create_relay_http_server(relay: GremlinRelay | None = None, host: str = "127
             parsed = urlparse(self.path)
             try:
                 if parsed.path == "/v1/rooms":
-                    request = _read_json(self)
+                    request = _read_json(self, max_body_bytes=max_body_bytes)
                     with lock:
                         room = relay.create_room(ttl_seconds=int(request.get("ttl_seconds", 600)))
                     _json_response(self, 201, {"room_id": room.room_id, "relay_token": room.token, "expires_at": room.expires_at})
                     return
                 parts = [part for part in parsed.path.split("/") if part]
                 if len(parts) == 4 and parts[:2] == ["v1", "rooms"] and parts[3] == "messages":
-                    request = _read_json(self)
+                    request = _read_json(self, max_body_bytes=max_body_bytes)
                     with lock:
                         response = relay.append_envelope(parts[2], str(request.get("relay_token", "")), request["envelope"])
                     _json_response(self, 201, response)
@@ -168,13 +199,15 @@ def create_relay_http_server(relay: GremlinRelay | None = None, host: str = "127
                 _json_response(self, 404, {"error": "not found"})
             except PermissionError as exc:
                 _json_response(self, 403, {"accepted": False, "error": str(exc)})
+            except RelayPayloadTooLarge as exc:
+                _json_response(self, 413, {"accepted": False, "error": str(exc)})
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 _json_response(self, 400, {"accepted": False, "error": str(exc)})
 
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
             if parsed.path == "/health":
-                _json_response(self, 200, {"ok": True, "rooms": len(relay.rooms)})
+                _json_response(self, 200, {"ok": True, "rooms": len(relay.rooms), "max_messages_per_room": relay.max_messages_per_room, "max_body_bytes": max_body_bytes})
                 return
             parts = [part for part in parsed.path.split("/") if part]
             if len(parts) == 4 and parts[:2] == ["v1", "rooms"] and parts[3] == "messages":
@@ -221,11 +254,23 @@ class RelayClient:
         return self._request("GET", f"/v1/rooms/{room_id}/messages?token={quote(relay_token)}&after={after}")
 
 
-def _read_json(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
+def _read_json(handler: BaseHTTPRequestHandler, *, max_body_bytes: int) -> dict[str, Any]:
     content_length = int(handler.headers.get("Content-Length", "0"))
     if content_length == 0:
         return {}
+    if content_length > max_body_bytes:
+        _drain_rejected_body(handler, content_length)
+        raise RelayPayloadTooLarge(f"request body exceeds {max_body_bytes} bytes")
     return json.loads(handler.rfile.read(content_length).decode("utf-8"))
+
+
+def _drain_rejected_body(handler: BaseHTTPRequestHandler, content_length: int) -> None:
+    remaining = min(content_length, MAX_REJECT_DRAIN_BYTES)
+    while remaining > 0:
+        chunk = handler.rfile.read(min(remaining, 64 * 1024))
+        if not chunk:
+            return
+        remaining -= len(chunk)
 
 
 def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:

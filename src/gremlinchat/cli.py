@@ -47,6 +47,7 @@ from .trial import (
     accept_trial_invite,
     create_trial_invite,
     current_trial_snapshot,
+    listen_once,
     run_live_read_only_proof,
     run_preflight,
     run_trial_simulation,
@@ -68,10 +69,18 @@ def setup(args: argparse.Namespace) -> None:
 def serve_relay(args: argparse.Namespace) -> None:
     if args.host == "0.0.0.0":
         print("WARNING: relay is bound to 0.0.0.0. Use a specific LAN/Tailscale IP for private trials when possible.")
-    server = create_relay_http_server(host=args.host, port=args.port, state_dir=args.state_dir)
+    server = create_relay_http_server(
+        host=args.host,
+        port=args.port,
+        state_dir=args.state_dir,
+        max_body_bytes=args.max_body_bytes,
+        max_messages_per_room=args.max_messages_per_room,
+        max_envelope_bytes=args.max_envelope_bytes,
+    )
     print(f"GremlinChat relay listening: http://{args.host}:{args.port}")
     if args.state_dir:
         print(f"GremlinChat relay persistence: {Path(args.state_dir).expanduser().resolve()}")
+    print(f"GremlinChat relay limits: max_body_bytes={args.max_body_bytes} max_envelope_bytes={args.max_envelope_bytes} max_messages_per_room={args.max_messages_per_room}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -336,6 +345,24 @@ def trial_prove_command(args: argparse.Namespace) -> None:
         raise SystemExit(1)
 
 
+def trial_listen_command(args: argparse.Namespace) -> None:
+    home = _home(args.home)
+    iteration = 0
+    try:
+        while args.max_iterations is None or iteration < args.max_iterations:
+            try:
+                summary = listen_once(home, room_id=args.room_id)
+            except GremlinChatError as exc:
+                raise SystemExit(str(exc)) from exc
+            print(json.dumps({"iteration": iteration, **summary}, sort_keys=True))
+            iteration += 1
+            if args.stop_when_idle and summary["count"] == 0:
+                return
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print("stopping GremlinChat trial listener")
+
+
 def trial_simulate_command(args: argparse.Namespace) -> None:
     report_home = None if args.no_report else _home(args.home)
     report = run_trial_simulation(write_report_home=report_home)
@@ -407,6 +434,9 @@ def build_parser() -> argparse.ArgumentParser:
     relay_serve.add_argument("--host", default="127.0.0.1")
     relay_serve.add_argument("--port", default=8778, type=int)
     relay_serve.add_argument("--state-dir", default=None, help="Optional directory for persistent relay state.")
+    relay_serve.add_argument("--max-body-bytes", default=256 * 1024, type=int, help="Reject HTTP request bodies above this size.")
+    relay_serve.add_argument("--max-envelope-bytes", default=128 * 1024, type=int, help="Reject encrypted envelopes above this size.")
+    relay_serve.add_argument("--max-messages-per-room", default=1000, type=int, help="Reject new messages after this many room messages.")
     relay_serve.set_defaults(func=serve_relay)
 
     room_parser = subcommands.add_parser("room", help="Pairing room commands")
@@ -492,6 +522,12 @@ def build_parser() -> argparse.ArgumentParser:
     trial_prove.add_argument("--interval", default=2.0, type=float)
     trial_prove.add_argument("--no-report", action="store_true", help="Do not write a redacted proof report")
     trial_prove.set_defaults(func=trial_prove_command)
+    trial_listen = trial_subcommands.add_parser("listen", help="Process live trial requests with the read-only lock enforced")
+    trial_listen.add_argument("--room-id", default=None)
+    trial_listen.add_argument("--interval", default=5.0, type=float)
+    trial_listen.add_argument("--max-iterations", default=None, type=int)
+    trial_listen.add_argument("--stop-when-idle", action="store_true")
+    trial_listen.set_defaults(func=trial_listen_command)
     trial_simulate = trial_subcommands.add_parser("simulate", help="Run a local two-client read-only proof through a relay")
     trial_simulate.add_argument("--no-report", action="store_true", help="Do not write a local trial report")
     trial_simulate.set_defaults(func=trial_simulate_command)
