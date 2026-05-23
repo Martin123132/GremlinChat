@@ -8,24 +8,30 @@ import time
 from pathlib import Path
 
 from .crypto import (
-    EncryptedEnvelope,
-    ReplayGuard,
-    derive_room_key,
-    open_message,
     parse_invite_code,
     safety_phrase,
-    seal_message,
     create_invite_code,
 )
 from .daemon import create_daemon_http_server
-from .messages import create_pair_hello, create_task_request, create_task_result, verify_pair_hello
+from .messages import create_pair_hello
 from .relay import RelayClient, create_relay_http_server
-from .runbooks import check_runbook_approval, execute_runbook, runbook_catalog, runbook_result_json
+from .roomops import (
+    GremlinChatError,
+    disable_room as disable_room_state,
+    fetch_room_messages as fetch_room_messages_state,
+    load_room as load_room_state,
+    owner_rejected_result as owner_rejected_result_state,
+    process_room_once as room_process_once,
+    request_runbook as send_runbook_request,
+    require_room_verified as require_room_verified_state,
+    revoke_room as revoke_room_state,
+    room_key as room_key_state,
+    sync_room_messages,
+    verify_room as verify_room_state,
+)
+from .runbooks import execute_runbook, runbook_catalog, runbook_result_json
 from .store import (
     ApprovedRepo,
-    RunbookPolicy,
-    approval_for_task,
-    create_pending_approval,
     decide_approval,
     default_home,
     ensure_home,
@@ -34,11 +40,10 @@ from .store import (
     load_or_create_x25519_identity,
     load_policy,
     load_rooms,
-    mark_approval_consumed,
     save_policy,
     save_room,
-    write_task_report,
 )
+from .trial import current_trial_snapshot, run_preflight, run_trial_simulation, write_trial_report
 
 
 def _home(raw: str | None) -> Path:
@@ -53,8 +58,12 @@ def setup(args: argparse.Namespace) -> None:
 
 
 def serve_relay(args: argparse.Namespace) -> None:
-    server = create_relay_http_server(host=args.host, port=args.port)
+    if args.host == "0.0.0.0":
+        print("WARNING: relay is bound to 0.0.0.0. Use a specific LAN/Tailscale IP for private trials when possible.")
+    server = create_relay_http_server(host=args.host, port=args.port, state_dir=args.state_dir)
     print(f"GremlinChat relay listening: http://{args.host}:{args.port}")
+    if args.state_dir:
+        print(f"GremlinChat relay persistence: {Path(args.state_dir).expanduser().resolve()}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -172,75 +181,38 @@ def join_room(args: argparse.Namespace) -> None:
 
 
 def sync_room(args: argparse.Namespace) -> None:
-    home = _home(args.home)
-    identity = load_or_create_identity(home)
-    x25519_identity = load_or_create_x25519_identity(home)
-    room = _load_room(home, args.room_id)
-    messages = _fetch_room_messages(room)
-    decrypted = []
-    updated = False
-    for record in messages:
-        envelope = record["envelope"]
-        if envelope.get("protocol") == "gremlinchat.pair-hello.v1":
-            if envelope.get("sender_node_id") != identity.node_id and verify_pair_hello(envelope):
-                room["peer_node_id"] = envelope["sender_node_id"]
-                room["peer_public_key"] = envelope["sender_public_key"]
-                room["peer_x25519_public_key"] = envelope["x25519_public_key"]
-                room["safety_phrase"] = safety_phrase(room["pair_secret"], [identity.public_key, envelope["sender_public_key"]])
-                updated = True
-            continue
-        if envelope.get("sender_node_id") == identity.node_id or "peer_x25519_public_key" not in room:
-            continue
-        try:
-            message = open_message(envelope=EncryptedEnvelope.from_dict(envelope), room_key=_room_key(room, identity, x25519_identity), replay_guard=ReplayGuard())
-            if message.get("type") == "task.result.v1":
-                message["report_paths"] = write_task_report(home, message)
-            decrypted.append(message)
-        except ValueError as exc:
-            decrypted.append({"type": "message.error", "error": str(exc)})
-    if updated:
-        save_room(room, home)
-    print(json.dumps({"room_id": room["room_id"], "peer_node_id": room.get("peer_node_id"), "safety_phrase": room.get("safety_phrase"), "message_count": len(messages), "decrypted_messages": decrypted}, indent=2, sort_keys=True))
+    try:
+        print(json.dumps(sync_room_messages(_home(args.home), args.room_id), indent=2, sort_keys=True))
+    except GremlinChatError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def verify_room(args: argparse.Namespace) -> None:
-    home = _home(args.home)
-    room = _load_room(home, args.room_id)
-    expected = str(room.get("safety_phrase") or "")
-    supplied = str(args.phrase or "").strip()
-    if not expected:
-        raise SystemExit("Room does not have a safety phrase yet. Run gremlinchat room sync first.")
-    if supplied != expected:
-        raise SystemExit("Safety phrase mismatch. Do not activate this room.")
-    if not room.get("peer_node_id") or not room.get("peer_public_key") or not room.get("peer_x25519_public_key"):
-        raise SystemExit("Room does not have complete peer identity yet. Run gremlinchat room sync first.")
-    room["verified"] = True
-    room["disabled"] = False
-    room["verified_at"] = round(time.time(), 3)
-    save_room(room, home)
-    print(json.dumps({"verified": True, "room_id": room["room_id"], "safety_phrase": expected}, indent=2, sort_keys=True))
+    try:
+        print(json.dumps(verify_room_state(_home(args.home), args.room_id, args.phrase), indent=2, sort_keys=True))
+    except GremlinChatError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def disable_room(args: argparse.Namespace) -> None:
-    home = _home(args.home)
-    room = _load_room(home, args.room_id)
-    room["verified"] = False
-    room["disabled"] = True
-    room["disabled_at"] = round(time.time(), 3)
-    save_room(room, home)
-    print(json.dumps({"disabled": True, "room_id": room["room_id"]}, indent=2, sort_keys=True))
+    try:
+        print(json.dumps(disable_room_state(_home(args.home), args.room_id), indent=2, sort_keys=True))
+    except GremlinChatError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def revoke_room(args: argparse.Namespace) -> None:
+    try:
+        print(json.dumps(revoke_room_state(_home(args.home), args.room_id), indent=2, sort_keys=True))
+    except GremlinChatError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def request_runbook(args: argparse.Namespace) -> None:
-    home = _home(args.home)
-    identity = load_or_create_identity(home)
-    x25519_identity = load_or_create_x25519_identity(home)
-    room = _load_room(home, args.room_id)
-    _require_room_verified(room)
-    request = create_task_request(runbook=args.runbook, payload=json.loads(args.payload_json or "{}"))
-    envelope = seal_message(room_id=room["room_id"], sender=identity, room_key=_room_key(room, identity, x25519_identity), message=request)
-    response = RelayClient(room["relay_url"]).post_envelope(room_id=room["room_id"], relay_token=room["relay_token"], envelope=envelope.to_dict())
-    print(json.dumps({"task_id": request["task_id"], "relay_response": response}, indent=2, sort_keys=True))
+    try:
+        print(json.dumps(send_runbook_request(_home(args.home), args.room_id, args.runbook, json.loads(args.payload_json or "{}")), indent=2, sort_keys=True))
+    except (GremlinChatError, json.JSONDecodeError) as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def process_room(args: argparse.Namespace) -> None:
@@ -263,50 +235,10 @@ def loop_room(args: argparse.Namespace) -> None:
 
 
 def _process_room_once(home: Path, room_id: str | None) -> dict:
-    identity = load_or_create_identity(home)
-    x25519_identity = load_or_create_x25519_identity(home)
-    policy = load_policy(home)
-    room = _load_room(home, room_id)
-    _require_room_verified(room)
-    processed = set(room.get("processed_message_ids", []))
-    replies = []
-    for record in _fetch_room_messages(room):
-        envelope_data = record["envelope"]
-        if envelope_data.get("protocol") != "gremlinchat.envelope.v1" or envelope_data.get("sender_node_id") == identity.node_id:
-            continue
-        message_id = envelope_data.get("message_id")
-        if message_id in processed:
-            continue
-        message = open_message(envelope=EncryptedEnvelope.from_dict(envelope_data), room_key=_room_key(room, identity, x25519_identity), replay_guard=ReplayGuard())
-        if message.get("type") != "task.request.v1":
-            continue
-        requester_node_id = str(envelope_data.get("sender_node_id"))
-        payload = dict(message.get("payload", {}))
-        runbook = str(message["runbook"])
-        existing_approval = approval_for_task(home, str(message["task_id"]))
-        approval_override = existing_approval is not None and existing_approval.get("status") == "approved"
-        if existing_approval and existing_approval.get("status") == "rejected":
-            result_dict = _owner_rejected_result(runbook)
-        elif not approval_override:
-            approval_check = check_runbook_approval(runbook, payload, policy=policy, requester_node_id=requester_node_id)
-            if approval_check.status == "pending":
-                approval = create_pending_approval(home, room_id=room["room_id"], task_id=str(message["task_id"]), requester_node_id=requester_node_id, runbook=runbook, payload=payload, reason=approval_check.reason)
-                replies.append({"task_id": message["task_id"], "runbook": runbook, "status": "pending_approval", "approval_id": approval["approval_id"]})
-                continue
-            result_dict = execute_runbook(runbook, payload, policy=policy, home=home, requester_node_id=requester_node_id).to_dict()
-        else:
-            result_dict = execute_runbook(runbook, payload, policy=policy, home=home, requester_node_id=requester_node_id, approval_override=True).to_dict()
-        reply = create_task_result(request=message, result=result_dict)
-        reply_envelope = seal_message(room_id=room["room_id"], sender=identity, room_key=_room_key(room, identity, x25519_identity), message=reply)
-        relay_response = RelayClient(room["relay_url"]).post_envelope(room_id=room["room_id"], relay_token=room["relay_token"], envelope=reply_envelope.to_dict())
-        if existing_approval:
-            mark_approval_consumed(home, str(existing_approval["approval_id"]))
-        report_paths = write_task_report(home, {"direction": "outgoing", "task_id": message["task_id"], "runbook": runbook, "result": result_dict, "relay_response": relay_response})
-        processed.add(str(message_id))
-        replies.append({"task_id": message["task_id"], "runbook": runbook, "relay_response": relay_response, "report_paths": report_paths})
-    room["processed_message_ids"] = sorted(processed)
-    save_room(room, home)
-    return {"processed": replies, "count": len(replies)}
+    try:
+        return room_process_once(home, room_id)
+    except GremlinChatError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def show_status(args: argparse.Namespace) -> None:
@@ -357,45 +289,63 @@ def decide_approval_command(args: argparse.Namespace) -> None:
     print(json.dumps({"approval": approval}, indent=2, sort_keys=True))
 
 
+def trial_preflight_command(args: argparse.Namespace) -> None:
+    report = run_preflight(_home(args.home), relay_url=args.relay, dashboard_port=args.dashboard_port, relay_port=args.relay_port)
+    if args.write_report:
+        report["report_paths"] = write_trial_report(_home(args.home), report)
+    print(json.dumps(report, indent=2, sort_keys=True))
+    if not report["ok"]:
+        raise SystemExit(1)
+
+
+def trial_simulate_command(args: argparse.Namespace) -> None:
+    report_home = None if args.no_report else _home(args.home)
+    report = run_trial_simulation(write_report_home=report_home)
+    print(json.dumps(report, indent=2, sort_keys=True))
+    if not report["ok"]:
+        raise SystemExit(1)
+
+
+def trial_report_command(args: argparse.Namespace) -> None:
+    home = _home(args.home)
+    if args.summary_json:
+        summary = json.loads(args.summary_json)
+    else:
+        summary = current_trial_snapshot(home)
+    paths = write_trial_report(home, summary)
+    print(json.dumps({"report_paths": paths}, indent=2, sort_keys=True))
+
+
 def _load_room(home: Path, room_id: str | None) -> dict:
-    rooms = load_rooms(home)
-    if room_id is None:
-        if len(rooms) != 1:
-            raise SystemExit("Pass --room-id when there is not exactly one GremlinChat room.")
-        return rooms[0]
-    for room in rooms:
-        if room.get("room_id") == room_id:
-            return room
-    raise SystemExit(f"Unknown GremlinChat room: {room_id}")
+    try:
+        return load_room_state(home, room_id)
+    except GremlinChatError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def _require_room_verified(room: dict) -> None:
-    if room.get("disabled"):
-        raise SystemExit("Room is disabled. Run room verify again only after confirming consent.")
-    if not room.get("verified"):
-        raise SystemExit("Room is not verified. Compare the safety phrase with the other person, then run gremlinchat room verify --phrase <phrase>.")
-    if not room.get("peer_node_id") or not room.get("peer_public_key") or not room.get("peer_x25519_public_key"):
-        raise SystemExit("Room is missing peer identity. Run gremlinchat room sync before verification.")
+    try:
+        require_room_verified_state(room)
+    except GremlinChatError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def _fetch_room_messages(room: dict) -> list[dict]:
-    response = RelayClient(room["relay_url"]).messages_after(room_id=room["room_id"], relay_token=room["relay_token"], after=-1)
-    if "messages" not in response:
-        raise SystemExit(f"Could not fetch room messages: {response}")
-    return list(response["messages"])
+    try:
+        return fetch_room_messages_state(room)
+    except GremlinChatError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def _room_key(room: dict, identity, x25519_identity) -> bytes:
-    peer_x25519 = room.get("peer_x25519_public_key")
-    peer_public = room.get("peer_public_key")
-    if not peer_x25519 or not peer_public:
-        raise SystemExit("Room is not ready; run gremlinchat room sync after the partner joins.")
-    return derive_room_key(local_private_key=x25519_identity.private_key, peer_public_key=peer_x25519, pair_secret=room["pair_secret"], participant_public_keys=[identity.public_key, peer_public])
+    try:
+        return room_key_state(room, identity, x25519_identity)
+    except GremlinChatError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def _owner_rejected_result(runbook: str) -> dict:
-    timestamp = round(time.time(), 3)
-    return {"accepted": False, "runbook": runbook, "status": "rejected", "summary": "Local owner rejected this GremlinChat request.", "output": {"error": "owner_rejected"}, "started_at": timestamp, "completed_at": timestamp}
+    return owner_rejected_result_state(runbook)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -418,6 +368,7 @@ def build_parser() -> argparse.ArgumentParser:
     relay_serve = relay_subcommands.add_parser("serve", help="Serve a relay")
     relay_serve.add_argument("--host", default="127.0.0.1")
     relay_serve.add_argument("--port", default=8778, type=int)
+    relay_serve.add_argument("--state-dir", default=None, help="Optional directory for persistent relay state.")
     relay_serve.set_defaults(func=serve_relay)
 
     room_parser = subcommands.add_parser("room", help="Pairing room commands")
@@ -439,6 +390,9 @@ def build_parser() -> argparse.ArgumentParser:
     room_disable = room_subcommands.add_parser("disable", help="Disable a room until it is verified again")
     room_disable.add_argument("--room-id", default=None)
     room_disable.set_defaults(func=disable_room)
+    room_revoke = room_subcommands.add_parser("revoke", help="Revoke a paired peer and disable the room")
+    room_revoke.add_argument("--room-id", default=None)
+    room_revoke.set_defaults(func=revoke_room)
     room_request = room_subcommands.add_parser("request", help="Send an encrypted runbook request")
     room_request.add_argument("--room-id", default=None)
     room_request.add_argument("--runbook", required=True)
@@ -478,6 +432,21 @@ def build_parser() -> argparse.ArgumentParser:
     approval_reject = approval_subcommands.add_parser("reject", help="Reject request")
     approval_reject.add_argument("approval_id")
     approval_reject.set_defaults(func=decide_approval_command)
+
+    trial_parser = subcommands.add_parser("trial", help="Read-only reliability trial commands")
+    trial_subcommands = trial_parser.add_subparsers(dest="trial_command", required=True)
+    trial_preflight = trial_subcommands.add_parser("preflight", help="Check whether this machine is ready for the private read-only trial")
+    trial_preflight.add_argument("--relay", default=None, help="Relay URL to check, such as http://100.x.y.z:8778")
+    trial_preflight.add_argument("--dashboard-port", default=8777, type=int)
+    trial_preflight.add_argument("--relay-port", default=8778, type=int)
+    trial_preflight.add_argument("--write-report", action="store_true", help="Write a redacted trial report under the local GremlinChat reports folder")
+    trial_preflight.set_defaults(func=trial_preflight_command)
+    trial_simulate = trial_subcommands.add_parser("simulate", help="Run a local two-client read-only proof through a relay")
+    trial_simulate.add_argument("--no-report", action="store_true", help="Do not write a local trial report")
+    trial_simulate.set_defaults(func=trial_simulate_command)
+    trial_report = trial_subcommands.add_parser("report", help="Write a redacted local trial report")
+    trial_report.add_argument("--summary-json", default=None, help="Optional JSON summary to write instead of a live local snapshot")
+    trial_report.set_defaults(func=trial_report_command)
     return parser
 
 

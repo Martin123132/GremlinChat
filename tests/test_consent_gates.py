@@ -2,9 +2,9 @@ from argparse import Namespace
 
 import pytest
 
-from gremlinchat.cli import _process_room_once, disable_room, verify_room
+from gremlinchat.cli import _process_room_once, disable_room, revoke_room, verify_room
 from gremlinchat.crypto import NodeIdentity, X25519Identity
-from gremlinchat.store import load_rooms, save_room
+from gremlinchat.store import load_policy, load_rooms, save_room
 
 
 def _room(peer=None, peer_x=None):
@@ -58,3 +58,20 @@ def test_room_disable_blocks_processing_until_reverified(tmp_path):
     with pytest.raises(SystemExit, match="disabled"):
         _process_room_once(tmp_path, "room_consent")
 
+
+def test_room_revoke_disables_room_and_revokes_peer(tmp_path):
+    peer = NodeIdentity.generate()
+    room = _room(peer=peer)
+    room["verified"] = True
+    save_room(room, tmp_path)
+
+    revoke_room(Namespace(home=str(tmp_path), room_id="room_consent"))
+    revoked = load_rooms(tmp_path)[0]
+    policy = load_policy(tmp_path)
+
+    assert revoked["verified"] is False
+    assert revoked["disabled"] is True
+    assert peer.node_id in policy.revoked_node_ids
+
+    with pytest.raises(SystemExit, match="disabled"):
+        _process_room_once(tmp_path, "room_consent")

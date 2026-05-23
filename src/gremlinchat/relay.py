@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import secrets
+import sqlite3
 import threading
 import time
+from contextlib import closing
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, quote, urlparse
@@ -25,12 +28,19 @@ class RelayRoom:
 
 
 class GremlinRelay:
-    def __init__(self):
+    def __init__(self, state_dir: str | Path | None = None):
         self.rooms: dict[str, RelayRoom] = {}
+        self.state_dir = None if state_dir is None else Path(state_dir).expanduser().resolve()
+        self.db_path = None if self.state_dir is None else self.state_dir / "relay.sqlite3"
+        if self.db_path is not None:
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+            self._init_db()
+            self._load_state()
 
     def create_room(self, *, ttl_seconds: int = 600) -> RelayRoom:
         room = RelayRoom(f"room_{secrets.token_urlsafe(18)}", secrets.token_urlsafe(32), round(time.time() + ttl_seconds, 3))
         self.rooms[room.room_id] = room
+        self._persist_room(room)
         return room
 
     def get_room(self, room_id: str, token: str) -> RelayRoom:
@@ -56,6 +66,8 @@ class GremlinRelay:
                 room.locked = True
         index = len(room.messages)
         room.messages.append({"index": index, "received_at": round(time.time(), 3), "envelope": envelope})
+        self._persist_room(room)
+        self._persist_message(room.room_id, room.messages[-1])
         return {"accepted": True, "index": index, "locked": room.locked}
 
     def messages_after(self, room_id: str, token: str, after: int = -1) -> dict[str, Any]:
@@ -67,9 +79,71 @@ class GremlinRelay:
             "messages": [message for message in room.messages if int(message["index"]) > after],
         }
 
+    def _connect(self) -> sqlite3.Connection:
+        if self.db_path is None:
+            raise RuntimeError("relay persistence is not enabled")
+        return sqlite3.connect(self.db_path)
 
-def create_relay_http_server(relay: GremlinRelay | None = None, host: str = "127.0.0.1", port: int = 8778) -> ThreadingHTTPServer:
-    relay = GremlinRelay() if relay is None else relay
+    def _init_db(self) -> None:
+        with closing(self._connect()) as db:
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS rooms (
+                  room_id TEXT PRIMARY KEY,
+                  token TEXT NOT NULL,
+                  expires_at REAL NOT NULL,
+                  locked INTEGER NOT NULL,
+                  participants_json TEXT NOT NULL
+                )
+                """
+            )
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS messages (
+                  room_id TEXT NOT NULL,
+                  message_index INTEGER NOT NULL,
+                  received_at REAL NOT NULL,
+                  envelope_json TEXT NOT NULL,
+                  PRIMARY KEY (room_id, message_index)
+                )
+                """
+            )
+            db.commit()
+
+    def _load_state(self) -> None:
+        if self.db_path is None:
+            return
+        with closing(self._connect()) as db:
+            room_rows = db.execute("SELECT room_id, token, expires_at, locked, participants_json FROM rooms").fetchall()
+            for room_id, token, expires_at, locked, participants_json in room_rows:
+                room = RelayRoom(str(room_id), str(token), float(expires_at), bool(locked), set(json.loads(participants_json)), [])
+                message_rows = db.execute("SELECT message_index, received_at, envelope_json FROM messages WHERE room_id = ? ORDER BY message_index", (room.room_id,)).fetchall()
+                room.messages = [{"index": int(index), "received_at": float(received_at), "envelope": json.loads(envelope_json)} for index, received_at, envelope_json in message_rows]
+                self.rooms[room.room_id] = room
+
+    def _persist_room(self, room: RelayRoom) -> None:
+        if self.db_path is None:
+            return
+        with closing(self._connect()) as db:
+            db.execute(
+                "INSERT OR REPLACE INTO rooms (room_id, token, expires_at, locked, participants_json) VALUES (?, ?, ?, ?, ?)",
+                (room.room_id, room.token, room.expires_at, 1 if room.locked else 0, json.dumps(sorted(room.participants))),
+            )
+            db.commit()
+
+    def _persist_message(self, room_id: str, message: dict[str, Any]) -> None:
+        if self.db_path is None:
+            return
+        with closing(self._connect()) as db:
+            db.execute(
+                "INSERT OR REPLACE INTO messages (room_id, message_index, received_at, envelope_json) VALUES (?, ?, ?, ?)",
+                (room_id, int(message["index"]), float(message["received_at"]), json.dumps(message["envelope"], sort_keys=True)),
+            )
+            db.commit()
+
+
+def create_relay_http_server(relay: GremlinRelay | None = None, host: str = "127.0.0.1", port: int = 8778, state_dir: str | Path | None = None) -> ThreadingHTTPServer:
+    relay = GremlinRelay(state_dir=state_dir) if relay is None else relay
     lock = threading.Lock()
 
     class RelayHandler(BaseHTTPRequestHandler):
@@ -161,4 +235,3 @@ def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[s
     handler.send_header("Content-Length", str(len(body)))
     handler.end_headers()
     handler.wfile.write(body)
-

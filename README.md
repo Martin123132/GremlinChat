@@ -27,7 +27,7 @@ gremlinchat setup
 Run a local relay:
 
 ```powershell
-gremlinchat relay serve --host 0.0.0.0 --port 8778
+gremlinchat relay serve --host 127.0.0.1 --port 8778 --state-dir "$env:LOCALAPPDATA\GremlinChat\relay"
 ```
 
 Create a room:
@@ -51,6 +51,40 @@ gremlinchat room sync
 gremlinchat room verify --phrase WORD-WORD-WORD-WORD
 gremlinchat room request --runbook presence.ping
 gremlinchat room sync
+```
+
+## Private Read-Only Trial
+
+For the first Martin/Glyn trial, use a private LAN or Tailscale IP for the relay. Avoid public relay exposure. If you bind the relay to `0.0.0.0`, GremlinChat prints a warning because every network interface is listening.
+
+Host relay on one trusted machine:
+
+```powershell
+gremlinchat relay serve --host YOUR_LAN_OR_TAILSCALE_IP --port 8778 --state-dir "$env:LOCALAPPDATA\GremlinChat\relay"
+```
+
+Check readiness:
+
+```powershell
+gremlinchat trial preflight --relay http://YOUR_LAN_OR_TAILSCALE_IP:8778 --write-report
+```
+
+Run a one-machine proof before involving another person:
+
+```powershell
+gremlinchat trial simulate
+```
+
+Write a redacted local trial report:
+
+```powershell
+gremlinchat trial report
+```
+
+Revoke a paired room immediately:
+
+```powershell
+gremlinchat room revoke
 ```
 
 Open the local dashboard:
@@ -80,6 +114,8 @@ Write-capable runbooks require owner configuration or approval:
 - `repo.pull_ff_only`
 - `worker.restart_named`
 - `tests.run_allowlisted`
+
+For the private read-only trial, GremlinChat keeps `trial_read_only_lock` on by default. That blocks write-capable runbooks even if an older local policy accidentally enabled them.
 
 Use this to stop all remote requests immediately:
 

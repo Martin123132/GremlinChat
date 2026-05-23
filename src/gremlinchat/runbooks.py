@@ -58,9 +58,11 @@ def check_runbook_approval(
     payload = {} if payload is None else payload
     try:
         _authorize_base(runbook, policy, requester_node_id=requester_node_id)
-        repo = _approved_repo(payload, policy) if runbook.startswith("repo.") or runbook == "tests.run_allowlisted" else None
         if runbook in READ_RUNBOOKS:
             return ApprovalCheck("auto", "Read-only runbook may run automatically.")
+        if runbook in WRITE_RUNBOOKS and policy.trial_read_only_lock:
+            return ApprovalCheck("reject", "Trial read-only lock is active; write-capable runbooks are disabled.")
+        repo = _approved_repo(payload, policy) if runbook.startswith("repo.") or runbook == "tests.run_allowlisted" else None
         if runbook == "repo.pull_ff_only":
             if runbook in policy.enabled_write_runbooks and repo is not None and repo.allow_pull_ff_only:
                 return ApprovalCheck("auto", "Fast-forward pull is pre-approved for this repo.")
@@ -148,6 +150,7 @@ def runbook_catalog(policy: RunbookPolicy) -> dict[str, Any]:
         "read_runbooks": sorted(READ_RUNBOOKS),
         "write_runbooks": sorted(WRITE_RUNBOOKS),
         "enabled_write_runbooks": sorted(policy.enabled_write_runbooks),
+        "trial_read_only_lock": policy.trial_read_only_lock,
         "approved_repos": [repo.to_dict() for repo in policy.approved_repos],
         "allowlisted_tests": sorted(policy.allowlisted_tests),
         "managed_workers": sorted(policy.managed_workers),
@@ -161,6 +164,8 @@ def runbook_result_json(result: RunbookResult) -> str:
 
 def _authorize(runbook: str, payload: dict[str, Any], policy: RunbookPolicy, *, requester_node_id: str | None, approval_override: bool = False) -> None:
     _authorize_base(runbook, policy, requester_node_id=requester_node_id)
+    if runbook in WRITE_RUNBOOKS and policy.trial_read_only_lock:
+        raise PermissionError("Trial read-only lock is active; write-capable runbooks are disabled.")
     if runbook in WRITE_RUNBOOKS and not approval_override and runbook not in policy.enabled_write_runbooks:
         raise PermissionError(f"Write-capable runbook {runbook!r} is not enabled by the machine owner.")
     if runbook.startswith("repo.") or runbook == "tests.run_allowlisted":
@@ -264,4 +269,3 @@ def _result(accepted: bool, runbook: str, status: str, summary: str, output: dic
     result = RunbookResult(accepted, runbook, status, summary, output, started_at, completed_at)
     append_audit_event(home, {"event_type": "runbook.result", "runbook": runbook, "accepted": accepted, "status": status, "summary": summary, "output": result.to_dict()["output"]})
     return result
-

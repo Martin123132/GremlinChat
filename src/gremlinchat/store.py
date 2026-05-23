@@ -55,6 +55,7 @@ class ApprovedRepo:
 @dataclass
 class RunbookPolicy:
     emergency_stop: bool = False
+    trial_read_only_lock: bool = True
     approved_repos: list[ApprovedRepo] = field(default_factory=list)
     enabled_write_runbooks: list[str] = field(default_factory=list)
     allowlisted_tests: dict[str, list[str]] = field(default_factory=dict)
@@ -64,6 +65,7 @@ class RunbookPolicy:
     def to_dict(self) -> dict[str, Any]:
         return {
             "emergency_stop": self.emergency_stop,
+            "trial_read_only_lock": self.trial_read_only_lock,
             "approved_repos": [repo.to_dict() for repo in self.approved_repos],
             "enabled_write_runbooks": list(self.enabled_write_runbooks),
             "allowlisted_tests": dict(self.allowlisted_tests),
@@ -75,6 +77,7 @@ class RunbookPolicy:
     def from_dict(cls, data: dict[str, Any]) -> "RunbookPolicy":
         return cls(
             emergency_stop=bool(data.get("emergency_stop", False)),
+            trial_read_only_lock=bool(data.get("trial_read_only_lock", True)),
             approved_repos=[ApprovedRepo.from_dict(item) for item in data.get("approved_repos", [])],
             enabled_write_runbooks=[str(item) for item in data.get("enabled_write_runbooks", [])],
             allowlisted_tests={str(key): [str(part) for part in value] for key, value in data.get("allowlisted_tests", {}).items()},
@@ -305,4 +308,3 @@ def _markdown_report(report: dict[str, Any]) -> str:
             "",
         ]
     )
-

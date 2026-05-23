@@ -8,8 +8,9 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
+from .roomops import GremlinChatError, disable_room, process_room_once, request_runbook, revoke_room, sync_room_messages
 from .runbooks import runbook_catalog
 from .store import decide_approval, load_approvals, load_or_create_identity, load_policy, load_rooms, read_audit_events, save_policy
 
@@ -40,7 +41,31 @@ def create_daemon_http_server(home: Path, host: str = "127.0.0.1", port: int = 8
                     policy = load_policy(home)
                     policy.emergency_stop = True
                     save_policy(policy, home)
-                    _json_response(self, 200, {"ok": True, "emergency_stop": True})
+                    _action_response(self, parsed, {"ok": True, "emergency_stop": True})
+                return
+            if parsed.path in {"/api/rooms/sync", "/api/rooms/request", "/api/rooms/disable", "/api/rooms/revoke"}:
+                room_id = parse_qs(parsed.query).get("room_id", [""])[0] or None
+                try:
+                    with lock:
+                        if parsed.path == "/api/rooms/sync":
+                            payload = {"ok": True, "sync": sync_room_messages(home, room_id)}
+                            try:
+                                payload["process"] = process_room_once(home, room_id)
+                            except GremlinChatError as exc:
+                                payload["process_error"] = str(exc)
+                        elif parsed.path == "/api/rooms/request":
+                            runbook = parse_qs(parsed.query).get("runbook", [""])[0]
+                            if runbook not in {"presence.ping", "gremlinchat.doctor"}:
+                                _json_response(self, 400, {"ok": False, "error": "dashboard only sends read-only ping and doctor requests"})
+                                return
+                            payload = {"ok": True, "request": request_runbook(home, room_id, runbook, {})}
+                        elif parsed.path == "/api/rooms/disable":
+                            payload = {"ok": True, "disable": disable_room(home, room_id)}
+                        else:
+                            payload = {"ok": True, "revoke": revoke_room(home, room_id)}
+                    _action_response(self, parsed, payload)
+                except GremlinChatError as exc:
+                    _json_response(self, 400, {"ok": False, "error": str(exc)})
                 return
             if parsed.path in {"/api/approvals/approve", "/api/approvals/reject"}:
                 approval_id = parse_qs(parsed.query).get("approval_id", [""])[0]
@@ -52,7 +77,7 @@ def create_daemon_http_server(home: Path, host: str = "127.0.0.1", port: int = 8
                 except KeyError as exc:
                     _json_response(self, 404, {"ok": False, "error": str(exc)})
                     return
-                _json_response(self, 200, {"ok": True, "approval": approval})
+                _action_response(self, parsed, {"ok": True, "approval": approval})
                 return
             _json_response(self, 404, {"error": "not found"})
 
@@ -89,12 +114,9 @@ def _render_dashboard(snapshot: dict[str, Any]) -> str:
     home = html.escape(snapshot["home"])
     policy = snapshot["policy"]
     pending = [approval for approval in snapshot["approvals"] if approval.get("status") == "pending"]
-    room_rows = "\n".join(
-        f"<tr><td><code>{html.escape(str(room.get('room_id', '')))}</code></td><td>{html.escape(str(room.get('relay_url', '')))}</td><td><code>{html.escape(str(room.get('peer_node_id', 'pending')))}</code></td><td>{html.escape(_room_state(room))}</td><td>{html.escape(str(room.get('safety_phrase', 'not ready')))}</td></tr>"
-        for room in snapshot["rooms"]
-    ) or "<tr><td colspan=\"5\" class=\"empty\">No paired rooms yet.</td></tr>"
+    room_rows = "\n".join(_room_row(room) for room in snapshot["rooms"]) or "<tr><td colspan=\"6\" class=\"empty\">No paired rooms yet.</td></tr>"
     approval_rows = "\n".join(
-        f"<tr><td><code>{html.escape(str(approval.get('approval_id', '')))}</code></td><td>{html.escape(str(approval.get('runbook', '')))}</td><td>{html.escape(str(approval.get('reason', '')))}</td><td><form method=\"post\" action=\"/api/approvals/approve?approval_id={html.escape(str(approval.get('approval_id', '')))}\"><button>Approve</button></form><form method=\"post\" action=\"/api/approvals/reject?approval_id={html.escape(str(approval.get('approval_id', '')))}\"><button>Reject</button></form></td></tr>"
+        f"<tr><td><code>{html.escape(str(approval.get('approval_id', '')))}</code></td><td>{html.escape(str(approval.get('runbook', '')))}</td><td>{html.escape(str(approval.get('reason', '')))}</td><td><form method=\"post\" action=\"/api/approvals/approve?approval_id={quote(str(approval.get('approval_id', '')), safe='')}&redirect=1\"><button>Approve</button></form><form method=\"post\" action=\"/api/approvals/reject?approval_id={quote(str(approval.get('approval_id', '')), safe='')}&redirect=1\"><button>Reject</button></form></td></tr>"
         for approval in pending
     ) or "<tr><td colspan=\"4\" class=\"empty\">No pending approvals.</td></tr>"
     audit_rows = "\n".join(
@@ -135,17 +157,39 @@ def _render_dashboard(snapshot: dict[str, Any]) -> str:
   <header><h1>GremlinChat</h1><div class="subhead">Local control room for <code>{node_id}</code>. Home: <code>{home}</code>.</div></header>
   <main>
     <div class="metrics">
-      <div class="metric"><span>Emergency Stop</span><strong><span class="state">{html.escape(emergency)}</span></strong></div>
+      <div class="metric"><span>Emergency Stop</span><strong><span class="state">{html.escape(emergency)}</span></strong><form method="post" action="/api/emergency-stop?redirect=1"><button>Emergency Stop</button></form></div>
       <div class="metric"><span>Rooms</span><strong>{len(snapshot["rooms"])}</strong></div>
       <div class="metric"><span>Pending Approvals</span><strong>{len(pending)}</strong></div>
       <div class="metric"><span>Write Runbooks</span><strong>{len(policy["enabled_write_runbooks"])}</strong></div>
     </div>
-    <section><h2>Rooms</h2><table><thead><tr><th>Room</th><th>Relay</th><th>Partner</th><th>State</th><th>Safety Phrase</th></tr></thead><tbody>{room_rows}</tbody></table></section>
+    <section><h2>Rooms</h2><table><thead><tr><th>Room</th><th>Relay</th><th>Partner</th><th>State</th><th>Safety Phrase</th><th>Actions</th></tr></thead><tbody>{room_rows}</tbody></table></section>
     <section><h2>Pending Approvals</h2><table><thead><tr><th>Approval</th><th>Runbook</th><th>Reason</th><th>Decision</th></tr></thead><tbody>{approval_rows}</tbody></table></section>
     <section><h2>Audit</h2><table><thead><tr><th>Time</th><th>Event</th><th>Runbook</th><th>Summary</th></tr></thead><tbody>{audit_rows}</tbody></table></section>
   </main>
 </body>
 </html>"""
+
+
+def _room_row(room: dict[str, Any]) -> str:
+    room_id = str(room.get("room_id", ""))
+    room_id_q = quote(room_id, safe="")
+    actions = " ".join(
+        [
+            f"<form method=\"post\" action=\"/api/rooms/sync?room_id={room_id_q}&redirect=1\"><button>Sync</button></form>",
+            f"<form method=\"post\" action=\"/api/rooms/request?room_id={room_id_q}&runbook=presence.ping&redirect=1\"><button>Ping</button></form>",
+            f"<form method=\"post\" action=\"/api/rooms/request?room_id={room_id_q}&runbook=gremlinchat.doctor&redirect=1\"><button>Doctor</button></form>",
+            f"<form method=\"post\" action=\"/api/rooms/disable?room_id={room_id_q}&redirect=1\"><button>Disable</button></form>",
+            f"<form method=\"post\" action=\"/api/rooms/revoke?room_id={room_id_q}&redirect=1\"><button>Revoke</button></form>",
+        ]
+    )
+    return (
+        f"<tr><td><code>{html.escape(room_id)}</code></td>"
+        f"<td>{html.escape(str(room.get('relay_url', '')))}</td>"
+        f"<td><code>{html.escape(str(room.get('peer_node_id', 'pending')))}</code></td>"
+        f"<td>{html.escape(_room_state(room))}</td>"
+        f"<td>{html.escape(str(room.get('safety_phrase', 'not ready')))}</td>"
+        f"<td>{actions}</td></tr>"
+    )
 
 
 def _room_state(room: dict[str, Any]) -> str:
@@ -172,3 +216,13 @@ def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[s
     handler.send_header("Content-Length", str(len(body)))
     handler.end_headers()
     handler.wfile.write(body)
+
+
+def _action_response(handler: BaseHTTPRequestHandler, parsed: Any, payload: dict[str, Any]) -> None:
+    if parse_qs(parsed.query).get("redirect", ["0"])[0] == "1":
+        handler.send_response(303)
+        handler.send_header("Location", "/dashboard")
+        handler.send_header("Content-Length", "0")
+        handler.end_headers()
+        return
+    _json_response(handler, 200, payload)
