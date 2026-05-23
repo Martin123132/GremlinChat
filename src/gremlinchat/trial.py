@@ -138,6 +138,85 @@ def accept_trial_invite(home: Path, code: str) -> dict[str, Any]:
     return result
 
 
+def run_host_session(home: Path, *, relay_url: str, ttl_seconds: int = 600) -> dict[str, Any]:
+    home = ensure_home(home)
+    lock = enforce_trial_read_only_lock(home)
+    preflight = run_preflight(home, relay_url=relay_url)
+    invite_packet = None
+    created_invite = False
+    warnings: list[str] = []
+
+    if preflight["ok"]:
+        active_rooms = _active_trial_rooms(home)
+        if active_rooms:
+            warnings.append("An active local room already exists, so no new invite was created.")
+        else:
+            invite_packet = create_trial_invite(home, relay_url=relay_url, ttl_seconds=ttl_seconds)
+            created_invite = True
+    else:
+        warnings.append("Preflight has failed checks, so no new invite was created.")
+
+    checklist = build_trial_checklist(home, role="host", relay_url=relay_url)
+    warnings.extend(checklist["warnings"])
+    result = {
+        "schema": "gremlinchat.trial-host-session.v1",
+        "ok": preflight["ok"] and checklist["ok"],
+        "role": "host",
+        "relay_url": relay_url,
+        "read_only_lock": lock,
+        "created_invite": created_invite,
+        "invite_packet": invite_packet,
+        "active_rooms": [_room_summary(room) for room in _active_trial_rooms(home)],
+        "preflight": preflight,
+        "checklist": checklist,
+        "commands": checklist["commands"],
+        "next_steps": _session_next_steps("host", checklist, created_invite=created_invite),
+        "warnings": warnings,
+    }
+    append_audit_event(home, {"event_type": "trial.host_session", "ok": result["ok"], "created_invite": created_invite, "relay_url": relay_url})
+    return result
+
+
+def run_guest_session(home: Path, code: str) -> dict[str, Any]:
+    home = ensure_home(home)
+    lock = enforce_trial_read_only_lock(home)
+    rooms = load_rooms(home)
+    invite = None if rooms else parse_invite_code(code)
+    relay_url = _first_room_relay_url(rooms) if rooms else invite.relay_url
+    preflight = run_preflight(home, relay_url=relay_url)
+    join_packet = None
+    joined = False
+    warnings: list[str] = []
+
+    if rooms:
+        warnings.append("A local room already exists, so the invite was not joined again.")
+    elif preflight["ok"]:
+        join_packet = accept_trial_invite(home, code)
+        joined = True
+    else:
+        warnings.append("Preflight has failed checks, so the invite was not joined.")
+
+    checklist = build_trial_checklist(home, role="guest", relay_url=relay_url)
+    warnings.extend(checklist["warnings"])
+    result = {
+        "schema": "gremlinchat.trial-guest-session.v1",
+        "ok": preflight["ok"] and checklist["ok"],
+        "role": "guest",
+        "relay_url": relay_url,
+        "read_only_lock": lock,
+        "joined": joined,
+        "join_packet": join_packet,
+        "active_rooms": [_room_summary(room) for room in _active_trial_rooms(home)],
+        "preflight": preflight,
+        "checklist": checklist,
+        "commands": checklist["commands"],
+        "next_steps": _session_next_steps("guest", checklist, joined=joined),
+        "warnings": warnings,
+    }
+    append_audit_event(home, {"event_type": "trial.guest_session", "ok": result["ok"], "joined": joined, "relay_url": relay_url})
+    return result
+
+
 def run_live_read_only_proof(
     home: Path,
     *,
@@ -242,11 +321,11 @@ def build_trial_checklist(home: Path, *, role: str, relay_url: str | None = None
     if role == "host":
         if not rooms:
             if relay_url:
-                commands.append(f"gremlinchat trial host --relay {relay_url}")
+                commands.append(f"gremlinchat trial host-session --relay {relay_url}")
                 next_steps.append("Share the GC1 invite privately, then wait for the guest to join.")
             else:
                 commands.append("gremlinchat trial preflight --relay http://YOUR_LAN_OR_TAILSCALE_IP:8778 --write-report")
-                commands.append("gremlinchat trial host --relay http://YOUR_LAN_OR_TAILSCALE_IP:8778")
+                commands.append("gremlinchat trial host-session --relay http://YOUR_LAN_OR_TAILSCALE_IP:8778")
                 next_steps.append("Start or choose the private relay, then create the host invite.")
         elif unverified_rooms:
             commands.append("gremlinchat room sync")
@@ -262,7 +341,7 @@ def build_trial_checklist(home: Path, *, role: str, relay_url: str | None = None
             next_steps.append("All known rooms are disabled or revoked; reset locally before creating a new trial.")
     else:
         if not rooms:
-            commands.append("gremlinchat trial guest GC1:...")
+            commands.append("gremlinchat trial guest-session GC1:...")
             next_steps.append("Paste only an invite code received privately from the host.")
         elif unverified_rooms:
             phrase = str(unverified_rooms[0].get("safety_phrase") or "WORD-WORD-WORD-WORD")
@@ -635,6 +714,43 @@ def _room_summary(room: dict[str, Any]) -> dict[str, Any]:
         for key, value in room.items()
         if key not in {"relay_token", "relay_token_protected", "pair_secret", "pair_secret_protected"}
     }
+
+
+def _active_trial_rooms(home: Path) -> list[dict[str, Any]]:
+    policy = load_policy(home)
+    revoked = set(policy.revoked_node_ids)
+    return [
+        room
+        for room in load_rooms(home)
+        if not room.get("disabled")
+        and not room.get("revoked_at")
+        and (not room.get("peer_node_id") or room.get("peer_node_id") not in revoked)
+    ]
+
+
+def _first_room_relay_url(rooms: list[dict[str, Any]]) -> str | None:
+    for room in rooms:
+        relay_url = room.get("relay_url")
+        if relay_url:
+            return str(relay_url)
+    return None
+
+
+def _session_next_steps(role: str, checklist: dict[str, Any], **flags: Any) -> list[str]:
+    if role == "host" and flags.get("created_invite"):
+        return [
+            "Share invite_packet.invite_code privately with the guest.",
+            "After the guest joins, run gremlinchat room sync.",
+            "Compare the safety phrase out of band and verify only if both sides match.",
+            "Ask the guest to run gremlinchat trial listen, then run gremlinchat trial prove.",
+        ]
+    if role == "guest" and flags.get("joined"):
+        return [
+            "Compare join_packet.safety_phrase with the host out of band.",
+            "Run gremlinchat room verify --phrase <phrase> only if both sides match.",
+            "Run gremlinchat trial listen while the host runs gremlinchat trial prove.",
+        ]
+    return list(checklist.get("next_steps", []))
 
 
 def _policy_for_bundle(policy: Any) -> dict[str, Any]:

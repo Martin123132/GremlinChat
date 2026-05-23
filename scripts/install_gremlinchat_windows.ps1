@@ -43,6 +43,12 @@ $PreflightShortcut.Arguments = "-NoExit -ExecutionPolicy Bypass -Command `"& '$G
 $PreflightShortcut.WorkingDirectory = $RepoRoot
 $PreflightShortcut.Save()
 
+$DoctorShortcut = $Shell.CreateShortcut((Join-Path $StartMenu "GremlinChat Install Doctor.lnk"))
+$DoctorShortcut.TargetPath = "powershell.exe"
+$DoctorShortcut.Arguments = "-NoExit -ExecutionPolicy Bypass -Command `"& '$GremlinExe' install doctor --write-report`""
+$DoctorShortcut.WorkingDirectory = $RepoRoot
+$DoctorShortcut.Save()
+
 $StopShortcut = $Shell.CreateShortcut((Join-Path $StartMenu "GremlinChat Emergency Stop.lnk"))
 $StopShortcut.TargetPath = $GremlinExe
 $StopShortcut.Arguments = "emergency-stop"
@@ -58,6 +64,9 @@ if ($StartWithWindows) {
   $StartupShortcut.WorkingDirectory = $RepoRoot
   $StartupShortcut.Save()
 }
+
+Write-Host "Running GremlinChat install doctor..."
+& $GremlinExe install doctor --write-report
 
 Write-Host "GremlinChat installed."
 Write-Host "Dashboard launcher: $StartMenu"

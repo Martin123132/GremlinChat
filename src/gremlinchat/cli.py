@@ -13,6 +13,7 @@ from .crypto import (
     create_invite_code,
 )
 from .daemon import create_daemon_http_server
+from .install import run_install_doctor, write_install_doctor_report
 from .messages import create_pair_hello
 from .relay import RelayClient, create_relay_http_server
 from .roomops import (
@@ -51,6 +52,8 @@ from .trial import (
     current_trial_snapshot,
     listen_once,
     reset_local_trial,
+    run_guest_session,
+    run_host_session,
     run_live_read_only_proof,
     run_preflight,
     run_trial_simulation,
@@ -288,6 +291,16 @@ def emergency_stop(args: argparse.Namespace) -> None:
     print(json.dumps({"emergency_stop": True, "home": str(home)}, indent=2, sort_keys=True))
 
 
+def install_doctor_command(args: argparse.Namespace) -> None:
+    home = _home(args.home)
+    report = run_install_doctor(home)
+    if args.write_report:
+        report["report_paths"] = write_install_doctor_report(home, report)
+    print(json.dumps(report, indent=2, sort_keys=True))
+    if not report["ok"]:
+        raise SystemExit(1)
+
+
 def approve_repo(args: argparse.Namespace) -> None:
     home = _home(args.home)
     policy = load_policy(home)
@@ -331,6 +344,26 @@ def trial_guest_command(args: argparse.Namespace) -> None:
         print(json.dumps(accept_trial_invite(_home(args.home), args.code), indent=2, sort_keys=True))
     except (GremlinChatError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
+
+
+def trial_host_session_command(args: argparse.Namespace) -> None:
+    try:
+        report = run_host_session(_home(args.home), relay_url=args.relay, ttl_seconds=args.ttl_seconds)
+    except GremlinChatError as exc:
+        raise SystemExit(str(exc)) from exc
+    print(json.dumps(report, indent=2, sort_keys=True))
+    if not report["ok"]:
+        raise SystemExit(1)
+
+
+def trial_guest_session_command(args: argparse.Namespace) -> None:
+    try:
+        report = run_guest_session(_home(args.home), args.code)
+    except (GremlinChatError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+    print(json.dumps(report, indent=2, sort_keys=True))
+    if not report["ok"]:
+        raise SystemExit(1)
 
 
 def trial_prove_command(args: argparse.Namespace) -> None:
@@ -444,6 +477,12 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands.add_parser("status", help="Show local status").set_defaults(func=show_status)
     subcommands.add_parser("emergency-stop", help="Disable all remote runbook requests").set_defaults(func=emergency_stop)
 
+    install_parser = subcommands.add_parser("install", help="Installer and local readiness commands")
+    install_subcommands = install_parser.add_subparsers(dest="install_command", required=True)
+    install_doctor = install_subcommands.add_parser("doctor", help="Check local installer/runtime readiness")
+    install_doctor.add_argument("--write-report", action="store_true", help="Write a redacted install doctor report under the local reports folder")
+    install_doctor.set_defaults(func=install_doctor_command)
+
     daemon_parser = subcommands.add_parser("daemon", help="Local dashboard commands")
     daemon_subcommands = daemon_parser.add_subparsers(dest="daemon_command", required=True)
     daemon_serve = daemon_subcommands.add_parser("serve", help="Serve the local dashboard")
@@ -539,6 +578,13 @@ def build_parser() -> argparse.ArgumentParser:
     trial_guest = trial_subcommands.add_parser("guest", help="Join a live two-machine read-only trial from a GC1 invite code")
     trial_guest.add_argument("code")
     trial_guest.set_defaults(func=trial_guest_command)
+    trial_host_session = trial_subcommands.add_parser("host-session", help="Run host preflight and create one invite only if needed")
+    trial_host_session.add_argument("--relay", required=True, help="Relay URL, such as http://100.x.y.z:8778")
+    trial_host_session.add_argument("--ttl-seconds", default=600, type=int)
+    trial_host_session.set_defaults(func=trial_host_session_command)
+    trial_guest_session = trial_subcommands.add_parser("guest-session", help="Run guest preflight and join one invite only if needed")
+    trial_guest_session.add_argument("code")
+    trial_guest_session.set_defaults(func=trial_guest_session_command)
     trial_prove = trial_subcommands.add_parser("prove", help="Send the read-only proof runbooks and wait for results")
     trial_prove.add_argument("--room-id", default=None)
     trial_prove.add_argument("--timeout-seconds", default=30.0, type=float)

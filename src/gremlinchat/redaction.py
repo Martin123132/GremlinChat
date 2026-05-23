@@ -5,8 +5,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
-SENSITIVE_KEY_PARTS = ("token", "secret", "password", "private", "apikey", "api_key", "authorization")
-SECRET_LIKE = re.compile(r"(?i)(sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{20,}|Bearer\s+[A-Za-z0-9._-]{16,})")
+SENSITIVE_KEY_PARTS = ("token", "secret", "password", "private", "apikey", "api_key", "authorization", "invite")
+SECRET_LIKE = re.compile(r"(?i)(GC1:[A-Za-z0-9_-]+|sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{20,}|Bearer\s+[A-Za-z0-9._-]{16,})")
 
 
 def redact_value(value: Any) -> Any:
@@ -23,4 +23,3 @@ def redact_value(value: Any) -> Any:
     if isinstance(value, str):
         return SECRET_LIKE.sub("[redacted]", value)
     return value
-

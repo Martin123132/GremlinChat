@@ -18,6 +18,8 @@ from gremlinchat.trial import (
     enforce_trial_read_only_lock,
     listen_once,
     reset_local_trial,
+    run_guest_session,
+    run_host_session,
     run_live_read_only_proof,
     run_trial_simulation,
     write_trial_bundle,
@@ -131,8 +133,8 @@ def test_trial_listener_enforces_read_only_lock(tmp_path):
 def test_trial_checklist_tracks_role_and_room_states(tmp_path):
     host_empty = build_trial_checklist(tmp_path, role="host", relay_url="http://relay.local:8778")
     guest_empty = build_trial_checklist(tmp_path, role="guest")
-    assert "gremlinchat trial host --relay http://relay.local:8778" in host_empty["commands"]
-    assert "gremlinchat trial guest GC1:..." in guest_empty["commands"]
+    assert "gremlinchat trial host-session --relay http://relay.local:8778" in host_empty["commands"]
+    assert "gremlinchat trial guest-session GC1:..." in guest_empty["commands"]
 
     peer = NodeIdentity.generate()
     save_room(_trial_room(peer=peer, verified=False), tmp_path)
@@ -213,6 +215,64 @@ def test_trial_reset_preserves_identity_and_revoked_peers(tmp_path):
     assert reset_policy.emergency_stop is False
     assert reset_policy.trial_read_only_lock is True
     assert reset_policy.revoked_node_ids == [peer.node_id]
+
+
+def test_trial_host_session_creates_one_invite_and_enforces_read_only_lock(tmp_path):
+    server = create_relay_http_server(host="127.0.0.1", port=0, state_dir=tmp_path / "relay")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    alice_home = tmp_path / "alice"
+    policy = load_policy(alice_home)
+    policy.trial_read_only_lock = False
+    save_policy(policy, alice_home)
+    try:
+        first = run_host_session(alice_home, relay_url=f"http://{host}:{port}")
+        second = run_host_session(alice_home, relay_url=f"http://{host}:{port}")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert first["ok"] is True
+    assert first["created_invite"] is True
+    assert first["read_only_lock"] == {"trial_read_only_lock": True, "changed": True}
+    assert first["invite_packet"]["invite_code"].startswith("GC1:")
+    assert second["ok"] is True
+    assert second["created_invite"] is False
+    assert second["invite_packet"] is None
+    assert len(load_rooms(alice_home)) == 1
+    assert load_policy(alice_home).trial_read_only_lock is True
+
+
+def test_trial_guest_session_joins_once_and_enforces_read_only_lock(tmp_path):
+    server = create_relay_http_server(host="127.0.0.1", port=0, state_dir=tmp_path / "relay")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    alice_home = tmp_path / "alice"
+    bob_home = tmp_path / "bob"
+    policy = load_policy(bob_home)
+    policy.trial_read_only_lock = False
+    save_policy(policy, bob_home)
+    try:
+        host_packet = create_trial_invite(alice_home, relay_url=f"http://{host}:{port}")
+        first = run_guest_session(bob_home, host_packet["invite_code"])
+        second = run_guest_session(bob_home, host_packet["invite_code"])
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert first["ok"] is True
+    assert first["joined"] is True
+    assert first["read_only_lock"] == {"trial_read_only_lock": True, "changed": True}
+    assert first["join_packet"]["hello_posted"] is True
+    assert second["ok"] is True
+    assert second["joined"] is False
+    assert second["join_packet"] is None
+    assert len(load_rooms(bob_home)) == 1
+    assert load_policy(bob_home).trial_read_only_lock is True
 
 
 def test_dashboard_revoke_and_emergency_stop_posts(tmp_path):

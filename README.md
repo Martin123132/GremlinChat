@@ -22,6 +22,7 @@ Exchange private connection details by phone, email, or a future private repo.
 ```powershell
 python -m pip install -e ".[dev]"
 gremlinchat setup
+gremlinchat install doctor --write-report
 ```
 
 Run a local relay:
@@ -68,6 +69,7 @@ The relay is deliberately small and capped: it rejects oversized request bodies,
 Check readiness:
 
 ```powershell
+gremlinchat install doctor --write-report
 gremlinchat trial preflight --relay http://YOUR_LAN_OR_TAILSCALE_IP:8778 --write-report
 ```
 
@@ -78,17 +80,19 @@ gremlinchat trial checklist --role host --relay http://YOUR_LAN_OR_TAILSCALE_IP:
 gremlinchat trial checklist --role guest
 ```
 
-Host creates the private invite:
+Host starts a guided session. This runs preflight, keeps the read-only lock on, and creates one invite only if there is no active local room:
 
 ```powershell
-gremlinchat trial host --relay http://YOUR_LAN_OR_TAILSCALE_IP:8778
+gremlinchat trial host-session --relay http://YOUR_LAN_OR_TAILSCALE_IP:8778
 ```
 
-Guest joins with the invite code shared privately:
+Guest starts a guided session with the invite code shared privately. This runs preflight, keeps the read-only lock on, and refuses to join a second room if one already exists:
 
 ```powershell
-gremlinchat trial guest GC1:...
+gremlinchat trial guest-session GC1:...
 ```
+
+The lower-level `trial host` and `trial guest` commands are still available for debugging, but `host-session` and `guest-session` are the recommended first live-trial path.
 
 Both sides compare the safety phrase by phone or another trusted channel, then each runs:
 
@@ -206,4 +210,10 @@ From a checked-out repo:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\install_gremlinchat_windows.ps1
+```
+
+The installer creates Start Menu shortcuts for Dashboard, Trial Listener, Preflight, Install Doctor, and Emergency Stop, then runs:
+
+```powershell
+gremlinchat install doctor --write-report
 ```
