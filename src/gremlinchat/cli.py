@@ -44,13 +44,17 @@ from .store import (
     save_room,
 )
 from .trial import (
+    RESET_CONFIRMATION,
     accept_trial_invite,
+    build_trial_checklist,
     create_trial_invite,
     current_trial_snapshot,
     listen_once,
+    reset_local_trial,
     run_live_read_only_proof,
     run_preflight,
     run_trial_simulation,
+    write_trial_bundle,
     write_trial_report,
 )
 
@@ -363,6 +367,25 @@ def trial_listen_command(args: argparse.Namespace) -> None:
         print("stopping GremlinChat trial listener")
 
 
+def trial_checklist_command(args: argparse.Namespace) -> None:
+    try:
+        print(json.dumps(build_trial_checklist(_home(args.home), role=args.role, relay_url=args.relay), indent=2, sort_keys=True))
+    except GremlinChatError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def trial_bundle_command(args: argparse.Namespace) -> None:
+    paths = write_trial_bundle(_home(args.home), relay_url=args.relay)
+    print(json.dumps({"bundle_paths": paths}, indent=2, sort_keys=True))
+
+
+def trial_reset_local_command(args: argparse.Namespace) -> None:
+    try:
+        print(json.dumps(reset_local_trial(_home(args.home), confirm=args.confirm), indent=2, sort_keys=True))
+    except GremlinChatError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
 def trial_simulate_command(args: argparse.Namespace) -> None:
     report_home = None if args.no_report else _home(args.home)
     report = run_trial_simulation(write_report_home=report_home)
@@ -528,6 +551,16 @@ def build_parser() -> argparse.ArgumentParser:
     trial_listen.add_argument("--max-iterations", default=None, type=int)
     trial_listen.add_argument("--stop-when-idle", action="store_true")
     trial_listen.set_defaults(func=trial_listen_command)
+    trial_checklist = trial_subcommands.add_parser("checklist", help="Show exact next commands for the live trial")
+    trial_checklist.add_argument("--role", required=True, choices=["host", "guest"])
+    trial_checklist.add_argument("--relay", default=None, help="Relay URL to include in host guidance")
+    trial_checklist.set_defaults(func=trial_checklist_command)
+    trial_bundle = trial_subcommands.add_parser("bundle", help="Write a redacted support bundle for trial debugging")
+    trial_bundle.add_argument("--relay", default=None, help="Optional relay URL to include a health check")
+    trial_bundle.set_defaults(func=trial_bundle_command)
+    trial_reset = trial_subcommands.add_parser("reset-local", help="Clear local trial rooms, approvals, and reports while preserving identity")
+    trial_reset.add_argument("--confirm", required=True, help=f"Must be {RESET_CONFIRMATION}")
+    trial_reset.set_defaults(func=trial_reset_local_command)
     trial_simulate = trial_subcommands.add_parser("simulate", help="Run a local two-client read-only proof through a relay")
     trial_simulate.add_argument("--no-report", action="store_true", help="Do not write a local trial report")
     trial_simulate.set_defaults(func=trial_simulate_command)

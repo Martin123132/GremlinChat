@@ -71,6 +71,13 @@ Check readiness:
 gremlinchat trial preflight --relay http://YOUR_LAN_OR_TAILSCALE_IP:8778 --write-report
 ```
 
+Show role-specific next steps at any point:
+
+```powershell
+gremlinchat trial checklist --role host --relay http://YOUR_LAN_OR_TAILSCALE_IP:8778
+gremlinchat trial checklist --role guest
+```
+
 Host creates the private invite:
 
 ```powershell
@@ -113,6 +120,18 @@ Write a redacted local trial report:
 
 ```powershell
 gremlinchat trial report
+```
+
+Write a redacted support bundle for debugging without pasting a huge terminal dump:
+
+```powershell
+gremlinchat trial bundle --relay http://YOUR_LAN_OR_TAILSCALE_IP:8778
+```
+
+Clear local trial rooms, approvals, and reports for a fresh attempt while preserving this machine's identity and revoked peers:
+
+```powershell
+gremlinchat trial reset-local --confirm RESET-GREMLINCHAT-TRIAL
 ```
 
 Revoke a paired room immediately:

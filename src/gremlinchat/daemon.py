@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, quote, urlparse
 from .roomops import GremlinChatError, disable_room, process_room_once, request_runbook, revoke_room, sync_room_messages
 from .runbooks import runbook_catalog
 from .store import decide_approval, load_approvals, load_or_create_identity, load_policy, load_rooms, read_audit_events, save_policy
+from .trial import RESET_CONFIRMATION, build_trial_checklist, reset_local_trial, trial_status, write_trial_bundle
 
 
 def create_daemon_http_server(home: Path, host: str = "127.0.0.1", port: int = 8777) -> ThreadingHTTPServer:
@@ -32,6 +33,20 @@ def create_daemon_http_server(home: Path, host: str = "127.0.0.1", port: int = 8
                 with lock:
                     _json_response(self, 200, _snapshot(home))
                 return
+            if parsed.path == "/api/trial/status":
+                query = parse_qs(parsed.query)
+                with lock:
+                    _json_response(self, 200, trial_status(home, relay_url=query.get("relay", [None])[0]))
+                return
+            if parsed.path == "/api/trial/checklist":
+                query = parse_qs(parsed.query)
+                role = query.get("role", ["host"])[0]
+                try:
+                    with lock:
+                        _json_response(self, 200, build_trial_checklist(home, role=role, relay_url=query.get("relay", [None])[0]))
+                except GremlinChatError as exc:
+                    _json_response(self, 400, {"ok": False, "error": str(exc)})
+                return
             _json_response(self, 404, {"error": "not found"})
 
         def do_POST(self) -> None:
@@ -42,6 +57,20 @@ def create_daemon_http_server(home: Path, host: str = "127.0.0.1", port: int = 8
                     policy.emergency_stop = True
                     save_policy(policy, home)
                     _action_response(self, parsed, {"ok": True, "emergency_stop": True})
+                return
+            if parsed.path == "/api/trial/bundle":
+                query = parse_qs(parsed.query)
+                with lock:
+                    _action_response(self, parsed, {"ok": True, "bundle_paths": write_trial_bundle(home, relay_url=query.get("relay", [None])[0])})
+                return
+            if parsed.path == "/api/trial/reset-local":
+                query = parse_qs(parsed.query)
+                confirm = query.get("confirm", [""])[0]
+                try:
+                    with lock:
+                        _action_response(self, parsed, {"ok": True, "reset": reset_local_trial(home, confirm=confirm)})
+                except GremlinChatError as exc:
+                    _json_response(self, 400, {"ok": False, "error": str(exc), "required_confirm": RESET_CONFIRMATION})
                 return
             if parsed.path in {"/api/rooms/sync", "/api/rooms/request", "/api/rooms/disable", "/api/rooms/revoke"}:
                 room_id = parse_qs(parsed.query).get("room_id", [""])[0] or None
@@ -98,6 +127,7 @@ def _snapshot(home: Path) -> dict[str, Any]:
         "policy": runbook_catalog(policy),
         "approvals": load_approvals(home),
         "audit": read_audit_events(home, limit=25),
+        "trial": trial_status(home),
     }
 
 
@@ -115,6 +145,8 @@ def _render_dashboard(snapshot: dict[str, Any]) -> str:
     policy = snapshot["policy"]
     pending = [approval for approval in snapshot["approvals"] if approval.get("status") == "pending"]
     room_rows = "\n".join(_room_row(room) for room in snapshot["rooms"]) or "<tr><td colspan=\"6\" class=\"empty\">No paired rooms yet.</td></tr>"
+    trial = snapshot["trial"]
+    trial_rows = _trial_rows(trial)
     approval_rows = "\n".join(
         f"<tr><td><code>{html.escape(str(approval.get('approval_id', '')))}</code></td><td>{html.escape(str(approval.get('runbook', '')))}</td><td>{html.escape(str(approval.get('reason', '')))}</td><td><form method=\"post\" action=\"/api/approvals/approve?approval_id={quote(str(approval.get('approval_id', '')), safe='')}&redirect=1\"><button>Approve</button></form><form method=\"post\" action=\"/api/approvals/reject?approval_id={quote(str(approval.get('approval_id', '')), safe='')}&redirect=1\"><button>Reject</button></form></td></tr>"
         for approval in pending
@@ -151,6 +183,8 @@ def _render_dashboard(snapshot: dict[str, Any]) -> str:
     .state {{ display:inline-block; min-width:72px; padding:4px 8px; border-radius:999px; background:{'#a13d35' if policy['emergency_stop'] else '#24734d'}; color:#fff; text-align:center; font-size:12px; }}
     .empty {{ color:var(--muted); }}
     button {{ margin:2px 0; padding:6px 10px; border:1px solid var(--line); border-radius:6px; background:#fff; cursor:pointer; }}
+    .actions {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:12px; }}
+    .actions a {{ display:inline-block; padding:6px 10px; border:1px solid var(--line); border-radius:6px; color:var(--text); text-decoration:none; background:#fff; }}
   </style>
 </head>
 <body>
@@ -162,12 +196,28 @@ def _render_dashboard(snapshot: dict[str, Any]) -> str:
       <div class="metric"><span>Pending Approvals</span><strong>{len(pending)}</strong></div>
       <div class="metric"><span>Write Runbooks</span><strong>{len(policy["enabled_write_runbooks"])}</strong></div>
     </div>
+    <section><h2>Trial</h2><table><thead><tr><th>Check</th><th>Status</th><th>Detail</th></tr></thead><tbody>{trial_rows}</tbody></table><div class="actions"><a href="/api/trial/checklist?role=host">Checklist</a><form method="post" action="/api/trial/bundle?redirect=1"><button>Bundle</button></form><form method="post" action="/api/emergency-stop?redirect=1"><button>Emergency Stop</button></form></div></section>
     <section><h2>Rooms</h2><table><thead><tr><th>Room</th><th>Relay</th><th>Partner</th><th>State</th><th>Safety Phrase</th><th>Actions</th></tr></thead><tbody>{room_rows}</tbody></table></section>
     <section><h2>Pending Approvals</h2><table><thead><tr><th>Approval</th><th>Runbook</th><th>Reason</th><th>Decision</th></tr></thead><tbody>{approval_rows}</tbody></table></section>
     <section><h2>Audit</h2><table><thead><tr><th>Time</th><th>Event</th><th>Runbook</th><th>Summary</th></tr></thead><tbody>{audit_rows}</tbody></table></section>
   </main>
 </body>
 </html>"""
+
+
+def _trial_rows(trial: dict[str, Any]) -> str:
+    latest = trial.get("latest_proof") or {}
+    rows = [
+        ("Preflight", "pass" if trial.get("ok") else "check", "No failed preflight checks." if trial.get("ok") else "One or more preflight checks need attention."),
+        ("Verified Rooms", str(trial.get("verified_room_count", 0)), f"{trial.get('room_count', 0)} total rooms"),
+        ("Read-Only Lock", "on" if trial.get("trial_read_only_lock") else "off", "Write-capable runbooks are blocked." if trial.get("trial_read_only_lock") else "Turn this on before a live trial."),
+        ("Emergency Stop", "on" if trial.get("emergency_stop") else "off", "Remote processing is disabled." if trial.get("emergency_stop") else "Remote read-only processing is allowed after verification."),
+        ("Latest Proof", str(latest.get("ok", "none")), str(latest.get("summary", "No proof report found."))),
+    ]
+    return "\n".join(
+        f"<tr><td>{html.escape(name)}</td><td><code>{html.escape(status)}</code></td><td>{html.escape(detail)}</td></tr>"
+        for name, status, detail in rows
+    )
 
 
 def _room_row(room: dict[str, Any]) -> str:

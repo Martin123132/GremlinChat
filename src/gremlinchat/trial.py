@@ -25,6 +25,7 @@ from .runbooks import READ_RUNBOOKS, runbook_catalog
 from .store import (
     append_audit_event,
     ensure_home,
+    load_approvals,
     load_or_create_identity,
     load_or_create_x25519_identity,
     load_policy,
@@ -36,6 +37,7 @@ from .store import (
 
 
 TRIAL_RUNBOOKS = ["presence.ping", "machine.status", "gremlinchat.doctor"]
+RESET_CONFIRMATION = "RESET-GREMLINCHAT-TRIAL"
 
 
 def create_trial_invite(home: Path, *, relay_url: str, ttl_seconds: int = 600) -> dict[str, Any]:
@@ -215,6 +217,165 @@ def listen_once(home: Path, *, room_id: str | None = None) -> dict[str, Any]:
     lock = enforce_trial_read_only_lock(home)
     processed = process_room_once(home, room_id)
     return {"read_only_lock": lock, **processed}
+
+
+def build_trial_checklist(home: Path, *, role: str, relay_url: str | None = None) -> dict[str, Any]:
+    home = ensure_home(home)
+    role = role.lower().strip()
+    if role not in {"host", "guest"}:
+        raise GremlinChatError("Trial checklist role must be host or guest.")
+    policy = load_policy(home)
+    rooms = load_rooms(home)
+    active_rooms = [room for room in rooms if not room.get("disabled")]
+    verified_rooms = [room for room in active_rooms if room.get("verified")]
+    unverified_rooms = [room for room in active_rooms if not room.get("verified")]
+    revoked_rooms = [room for room in rooms if room.get("peer_node_id") in policy.revoked_node_ids or room.get("revoked_at")]
+    commands: list[str] = []
+    next_steps: list[str] = []
+    warnings: list[str] = []
+
+    if policy.emergency_stop:
+        warnings.append("Emergency stop is active. Run a local reset or manually clear it only if you intend to continue.")
+    if not policy.trial_read_only_lock:
+        warnings.append("Read-only trial lock is off. Run gremlinchat trial listen or gremlinchat trial preflight before processing requests.")
+
+    if role == "host":
+        if not rooms:
+            if relay_url:
+                commands.append(f"gremlinchat trial host --relay {relay_url}")
+                next_steps.append("Share the GC1 invite privately, then wait for the guest to join.")
+            else:
+                commands.append("gremlinchat trial preflight --relay http://YOUR_LAN_OR_TAILSCALE_IP:8778 --write-report")
+                commands.append("gremlinchat trial host --relay http://YOUR_LAN_OR_TAILSCALE_IP:8778")
+                next_steps.append("Start or choose the private relay, then create the host invite.")
+        elif unverified_rooms:
+            commands.append("gremlinchat room sync")
+            phrase = str(unverified_rooms[0].get("safety_phrase") or "WORD-WORD-WORD-WORD")
+            commands.append(f"gremlinchat room verify --phrase {phrase}")
+            next_steps.append("Compare the safety phrase out of band before running verify.")
+        elif verified_rooms:
+            commands.append("gremlinchat trial prove")
+            commands.append("gremlinchat trial bundle")
+            next_steps.append("Ask the guest to run gremlinchat trial listen, then run the proof.")
+        else:
+            commands.append("gremlinchat trial reset-local --confirm RESET-GREMLINCHAT-TRIAL")
+            next_steps.append("All known rooms are disabled or revoked; reset locally before creating a new trial.")
+    else:
+        if not rooms:
+            commands.append("gremlinchat trial guest GC1:...")
+            next_steps.append("Paste only an invite code received privately from the host.")
+        elif unverified_rooms:
+            phrase = str(unverified_rooms[0].get("safety_phrase") or "WORD-WORD-WORD-WORD")
+            commands.append(f"gremlinchat room verify --phrase {phrase}")
+            next_steps.append("Compare this safety phrase with the host out of band before verifying.")
+        elif verified_rooms:
+            commands.append("gremlinchat trial listen")
+            commands.append("gremlinchat trial bundle")
+            next_steps.append("Keep the listener running while the host runs gremlinchat trial prove.")
+        else:
+            commands.append("gremlinchat trial reset-local --confirm RESET-GREMLINCHAT-TRIAL")
+            next_steps.append("All known rooms are disabled or revoked; reset locally before joining a fresh invite.")
+
+    return {
+        "schema": "gremlinchat.trial-checklist.v1",
+        "role": role,
+        "ok": not policy.emergency_stop and policy.trial_read_only_lock,
+        "relay_url": relay_url,
+        "room_count": len(rooms),
+        "verified_room_count": len(verified_rooms),
+        "revoked_room_count": len(revoked_rooms),
+        "emergency_stop": policy.emergency_stop,
+        "trial_read_only_lock": policy.trial_read_only_lock,
+        "commands": commands,
+        "next_steps": next_steps,
+        "warnings": warnings,
+        "rooms": [_room_summary(room) for room in rooms],
+    }
+
+
+def trial_status(home: Path, *, relay_url: str | None = None) -> dict[str, Any]:
+    home = ensure_home(home)
+    identity = load_or_create_identity(home)
+    policy = load_policy(home)
+    rooms = [_room_summary(room) for room in load_rooms(home)]
+    preflight = run_preflight(home, relay_url=relay_url)
+    latest_proof = _latest_report_summary(home, schema="gremlinchat.live-readonly-proof.v1")
+    return {
+        "schema": "gremlinchat.trial-status.v1",
+        "ok": preflight["ok"],
+        "created_at": round(time.time(), 3),
+        "node_id": identity.node_id,
+        "verified_room_count": len([room for room in rooms if room.get("verified") and not room.get("disabled")]),
+        "room_count": len(rooms),
+        "trial_read_only_lock": policy.trial_read_only_lock,
+        "emergency_stop": policy.emergency_stop,
+        "latest_proof": latest_proof,
+        "preflight": preflight,
+        "rooms": rooms,
+    }
+
+
+def write_trial_bundle(home: Path, *, relay_url: str | None = None) -> dict[str, str]:
+    home = ensure_home(home)
+    bundle = _sanitize_bundle(
+        home,
+        {
+            "schema": "gremlinchat.trial-bundle.v1",
+            "created_at": round(time.time(), 3),
+            "home": str(home),
+            "preflight": run_preflight(home, relay_url=relay_url),
+            "rooms": [_room_summary(room) for room in load_rooms(home)],
+            "policy": _policy_for_bundle(load_policy(home)),
+            "approvals": load_approvals(home),
+            "audit": read_audit_events(home, limit=50),
+            "reports": _reports_index(home),
+            "versions": _version_summary(),
+            "relay_health": None if relay_url is None else _relay_health_payload(relay_url),
+        },
+    )
+    reports_dir = home / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    suffix = uuid.uuid4().hex[:8]
+    json_path = reports_dir / f"bundle-{stamp}-{suffix}.json"
+    md_path = reports_dir / f"bundle-{stamp}-{suffix}.md"
+    json_path.write_text(json.dumps(bundle, indent=2, sort_keys=True), encoding="utf-8")
+    md_path.write_text(_bundle_markdown(bundle), encoding="utf-8")
+    append_audit_event(home, {"event_type": "trial.bundle", "json": str(json_path), "markdown": str(md_path)})
+    return {"json": str(json_path), "markdown": str(md_path)}
+
+
+def reset_local_trial(home: Path, *, confirm: str) -> dict[str, Any]:
+    if confirm != RESET_CONFIRMATION:
+        raise GremlinChatError(f"Refusing reset without --confirm {RESET_CONFIRMATION}.")
+    home = ensure_home(home)
+    identity = load_or_create_identity(home)
+    policy = load_policy(home)
+    revoked_node_ids = list(policy.revoked_node_ids)
+    removed: list[str] = []
+    for filename in ["rooms.json", "approvals.json"]:
+        path = home / filename
+        if path.exists():
+            path.unlink()
+            removed.append(filename)
+    reports_dir = home / "reports"
+    if reports_dir.exists():
+        shutil.rmtree(reports_dir)
+        removed.append("reports")
+    policy.emergency_stop = False
+    policy.trial_read_only_lock = True
+    policy.revoked_node_ids = revoked_node_ids
+    save_policy(policy, home)
+    append_audit_event(home, {"event_type": "trial.reset_local", "removed": removed, "preserved_node_id": identity.node_id})
+    return {
+        "reset": True,
+        "home": str(home),
+        "preserved_node_id": identity.node_id,
+        "preserved_revoked_node_ids": revoked_node_ids,
+        "removed": removed,
+        "trial_read_only_lock": True,
+        "emergency_stop": False,
+    }
 
 
 def run_preflight(
@@ -476,6 +637,109 @@ def _room_summary(room: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _policy_for_bundle(policy: Any) -> dict[str, Any]:
+    data = runbook_catalog(policy)
+    for repo in data.get("approved_repos", []):
+        if "path" in repo:
+            repo["path"] = "[redacted-path]"
+    return data
+
+
+def _reports_index(home: Path) -> list[dict[str, Any]]:
+    reports_dir = home / "reports"
+    if not reports_dir.exists():
+        return []
+    rows = []
+    for path in sorted(reports_dir.glob("*"))[-50:]:
+        if not path.is_file():
+            continue
+        item: dict[str, Any] = {"name": path.name, "size": path.stat().st_size, "modified_at": path.stat().st_mtime}
+        if path.suffix.lower() == ".json":
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                item["schema"] = data.get("schema")
+                item["ok"] = data.get("ok")
+                item["summary"] = data.get("summary")
+            except (OSError, json.JSONDecodeError):
+                item["schema"] = "unreadable-json"
+        rows.append(item)
+    return rows
+
+
+def _latest_report_summary(home: Path, *, schema: str) -> dict[str, Any] | None:
+    reports_dir = home / "reports"
+    if not reports_dir.exists():
+        return None
+    candidates = sorted(reports_dir.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True)
+    for path in candidates:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if data.get("schema") == schema:
+            return _sanitize_bundle(
+                home,
+                {
+                    "name": path.name,
+                    "modified_at": path.stat().st_mtime,
+                    "ok": data.get("ok"),
+                    "summary": data.get("summary"),
+                    "runbook_results": data.get("runbook_results", []),
+                },
+            )
+    return None
+
+
+def _version_summary() -> dict[str, Any]:
+    git_version = subprocess.run(["git", "--version"], check=False, capture_output=True, text=True, timeout=5) if shutil.which("git") else None
+    return {
+        "python_version": sys.version.split()[0],
+        "platform": sys.platform,
+        "git_version": None if git_version is None else (git_version.stdout or git_version.stderr).strip(),
+    }
+
+
+def _relay_health_payload(relay_url: str) -> dict[str, Any]:
+    status, summary, detail = _relay_check(relay_url)
+    return {"status": status, "summary": summary, "detail": redact_value(detail)}
+
+
+def _sanitize_bundle(home: Path, value: Any) -> Any:
+    home_text = str(home)
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, nested in value.items():
+            key_lower = str(key).lower()
+            if any(part in key_lower for part in ["token", "secret", "private", "password", "apikey", "api_key", "authorization", "invite_code"]):
+                result[key] = "[redacted]"
+            elif key_lower in {"safety_phrase", "phrase"}:
+                result[key] = "[redacted]"
+            elif key_lower in {"stdout", "stderr", "command", "output"}:
+                result[key] = "[redacted-log]"
+            elif key_lower.endswith("path") or key_lower in {"home", "cwd", "executable"}:
+                result[key] = _redact_path(home_text, nested)
+            else:
+                result[key] = _sanitize_bundle(home, nested)
+        return redact_value(result)
+    if isinstance(value, list):
+        return [_sanitize_bundle(home, item) for item in value]
+    if isinstance(value, str):
+        return redact_value(_redact_path(home_text, value))
+    return value
+
+
+def _redact_path(home_text: str, value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    normalized = value.replace("\\", "/")
+    home_normalized = home_text.replace("\\", "/")
+    if home_normalized and home_normalized in normalized:
+        return normalized.replace(home_normalized, "%GREMLINCHAT_HOME%")
+    if ":/" in normalized or normalized.startswith("/") or normalized.startswith("~"):
+        return "[redacted-path]"
+    return value
+
+
 def _trial_markdown(summary: dict[str, Any]) -> str:
     checks = summary.get("checks", [])
     check_lines = [f"- `{check.get('status')}` {check.get('name')}: {check.get('summary')}" for check in checks]
@@ -503,6 +767,38 @@ def _trial_markdown(summary: dict[str, Any]) -> str:
             "",
             "```json",
             json.dumps(summary, indent=2, sort_keys=True),
+            "```",
+            "",
+        ]
+    )
+
+
+def _bundle_markdown(bundle: dict[str, Any]) -> str:
+    checks = bundle.get("preflight", {}).get("checks", [])
+    check_lines = [f"- `{check.get('status')}` {check.get('name')}: {check.get('summary')}" for check in checks]
+    reports = bundle.get("reports", [])
+    report_lines = [f"- `{report.get('name')}` schema=`{report.get('schema')}` ok=`{report.get('ok')}`" for report in reports]
+    return "\n".join(
+        [
+            "# GremlinChat Trial Bundle",
+            "",
+            f"- Created: `{bundle.get('created_at', '')}`",
+            f"- Rooms: `{len(bundle.get('rooms', []))}`",
+            f"- Emergency Stop: `{bundle.get('policy', {}).get('emergency_stop')}`",
+            f"- Read-Only Lock: `{bundle.get('policy', {}).get('trial_read_only_lock')}`",
+            "",
+            "## Preflight",
+            "",
+            *(check_lines or ["- No preflight checks recorded."]),
+            "",
+            "## Reports",
+            "",
+            *(report_lines or ["- No reports indexed."]),
+            "",
+            "## JSON",
+            "",
+            "```json",
+            json.dumps(bundle, indent=2, sort_keys=True),
             "```",
             "",
         ]

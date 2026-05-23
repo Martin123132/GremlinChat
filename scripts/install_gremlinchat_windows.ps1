@@ -31,6 +31,18 @@ $DashboardShortcut.Arguments = "-NoExit -ExecutionPolicy Bypass -Command `"& '$G
 $DashboardShortcut.WorkingDirectory = $RepoRoot
 $DashboardShortcut.Save()
 
+$ListenerShortcut = $Shell.CreateShortcut((Join-Path $StartMenu "GremlinChat Trial Listener.lnk"))
+$ListenerShortcut.TargetPath = "powershell.exe"
+$ListenerShortcut.Arguments = "-NoExit -ExecutionPolicy Bypass -Command `"& '$GremlinExe' trial listen`""
+$ListenerShortcut.WorkingDirectory = $RepoRoot
+$ListenerShortcut.Save()
+
+$PreflightShortcut = $Shell.CreateShortcut((Join-Path $StartMenu "GremlinChat Preflight.lnk"))
+$PreflightShortcut.TargetPath = "powershell.exe"
+$PreflightShortcut.Arguments = "-NoExit -ExecutionPolicy Bypass -Command `"& '$GremlinExe' trial preflight --write-report`""
+$PreflightShortcut.WorkingDirectory = $RepoRoot
+$PreflightShortcut.Save()
+
 $StopShortcut = $Shell.CreateShortcut((Join-Path $StartMenu "GremlinChat Emergency Stop.lnk"))
 $StopShortcut.TargetPath = $GremlinExe
 $StopShortcut.Arguments = "emergency-stop"
@@ -50,4 +62,3 @@ if ($StartWithWindows) {
 Write-Host "GremlinChat installed."
 Write-Host "Dashboard launcher: $StartMenu"
 Write-Host "Dashboard URL: http://127.0.0.1:8777/dashboard"
-
