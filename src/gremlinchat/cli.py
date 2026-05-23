@@ -43,7 +43,15 @@ from .store import (
     save_policy,
     save_room,
 )
-from .trial import current_trial_snapshot, run_preflight, run_trial_simulation, write_trial_report
+from .trial import (
+    accept_trial_invite,
+    create_trial_invite,
+    current_trial_snapshot,
+    run_live_read_only_proof,
+    run_preflight,
+    run_trial_simulation,
+    write_trial_report,
+)
 
 
 def _home(raw: str | None) -> Path:
@@ -298,6 +306,36 @@ def trial_preflight_command(args: argparse.Namespace) -> None:
         raise SystemExit(1)
 
 
+def trial_host_command(args: argparse.Namespace) -> None:
+    try:
+        print(json.dumps(create_trial_invite(_home(args.home), relay_url=args.relay, ttl_seconds=args.ttl_seconds), indent=2, sort_keys=True))
+    except GremlinChatError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def trial_guest_command(args: argparse.Namespace) -> None:
+    try:
+        print(json.dumps(accept_trial_invite(_home(args.home), args.code), indent=2, sort_keys=True))
+    except (GremlinChatError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def trial_prove_command(args: argparse.Namespace) -> None:
+    try:
+        report = run_live_read_only_proof(
+            _home(args.home),
+            room_id=args.room_id,
+            timeout_seconds=args.timeout_seconds,
+            poll_interval=args.interval,
+            write_report=not args.no_report,
+        )
+    except GremlinChatError as exc:
+        raise SystemExit(str(exc)) from exc
+    print(json.dumps(report, indent=2, sort_keys=True))
+    if not report["ok"]:
+        raise SystemExit(1)
+
+
 def trial_simulate_command(args: argparse.Namespace) -> None:
     report_home = None if args.no_report else _home(args.home)
     report = run_trial_simulation(write_report_home=report_home)
@@ -441,6 +479,19 @@ def build_parser() -> argparse.ArgumentParser:
     trial_preflight.add_argument("--relay-port", default=8778, type=int)
     trial_preflight.add_argument("--write-report", action="store_true", help="Write a redacted trial report under the local GremlinChat reports folder")
     trial_preflight.set_defaults(func=trial_preflight_command)
+    trial_host = trial_subcommands.add_parser("host", help="Create a private invite for a live two-machine read-only trial")
+    trial_host.add_argument("--relay", required=True, help="Relay URL, such as http://100.x.y.z:8778")
+    trial_host.add_argument("--ttl-seconds", default=600, type=int)
+    trial_host.set_defaults(func=trial_host_command)
+    trial_guest = trial_subcommands.add_parser("guest", help="Join a live two-machine read-only trial from a GC1 invite code")
+    trial_guest.add_argument("code")
+    trial_guest.set_defaults(func=trial_guest_command)
+    trial_prove = trial_subcommands.add_parser("prove", help="Send the read-only proof runbooks and wait for results")
+    trial_prove.add_argument("--room-id", default=None)
+    trial_prove.add_argument("--timeout-seconds", default=30.0, type=float)
+    trial_prove.add_argument("--interval", default=2.0, type=float)
+    trial_prove.add_argument("--no-report", action="store_true", help="Do not write a redacted proof report")
+    trial_prove.set_defaults(func=trial_prove_command)
     trial_simulate = trial_subcommands.add_parser("simulate", help="Run a local two-client read-only proof through a relay")
     trial_simulate.add_argument("--no-report", action="store_true", help="Do not write a local trial report")
     trial_simulate.set_defaults(func=trial_simulate_command)

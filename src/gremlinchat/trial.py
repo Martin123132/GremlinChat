@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.error import URLError
 from urllib.request import urlopen
 
@@ -35,6 +35,167 @@ from .store import (
 
 
 TRIAL_RUNBOOKS = ["presence.ping", "machine.status", "gremlinchat.doctor"]
+
+
+def create_trial_invite(home: Path, *, relay_url: str, ttl_seconds: int = 600) -> dict[str, Any]:
+    home = ensure_home(home)
+    identity = load_or_create_identity(home)
+    x25519_identity = load_or_create_x25519_identity(home)
+    room_response = RelayClient(relay_url).create_room(ttl_seconds=ttl_seconds)
+    if "room_id" not in room_response:
+        raise GremlinChatError(f"relay room creation failed: {room_response}")
+    invite_code = create_invite_code(
+        creator=identity,
+        creator_x25519_public_key=x25519_identity.public_key,
+        relay_url=relay_url,
+        room_id=room_response["room_id"],
+        relay_token=room_response["relay_token"],
+        ttl_seconds=ttl_seconds,
+    )
+    invite = parse_invite_code(invite_code)
+    save_room(
+        {
+            "room_id": invite.room_id,
+            "relay_url": invite.relay_url,
+            "relay_token": invite.relay_token,
+            "pair_secret": invite.pair_secret,
+            "local_x25519_public_key": x25519_identity.public_key,
+            "created_by": identity.node_id,
+            "created_at": round(time.time(), 3),
+            "expires_at": invite.expires_at,
+            "verified": False,
+            "disabled": False,
+            "processed_message_ids": [],
+        },
+        home,
+    )
+    result = {
+        "schema": "gremlinchat.trial-host.v1",
+        "room_id": invite.room_id,
+        "relay_url": invite.relay_url,
+        "expires_at": invite.expires_at,
+        "invite_code": invite_code,
+        "next_steps": [
+            "Share the invite code privately.",
+            "Ask the guest to run gremlinchat trial guest GC1:...",
+            "Run gremlinchat room sync, compare the safety phrase out of band, then run gremlinchat room verify --phrase <phrase>.",
+            "After both sides verify, ask the guest to run gremlinchat room loop and run gremlinchat trial prove.",
+        ],
+    }
+    append_audit_event(home, {"event_type": "trial.host_invite_created", "room_id": invite.room_id, "relay_url": invite.relay_url, "expires_at": invite.expires_at})
+    return result
+
+
+def accept_trial_invite(home: Path, code: str) -> dict[str, Any]:
+    home = ensure_home(home)
+    identity = load_or_create_identity(home)
+    x25519_identity = load_or_create_x25519_identity(home)
+    invite = parse_invite_code(code)
+    phrase = safety_phrase(invite.pair_secret, [invite.creator_public_key, identity.public_key])
+    save_room(
+        {
+            "room_id": invite.room_id,
+            "relay_url": invite.relay_url,
+            "relay_token": invite.relay_token,
+            "pair_secret": invite.pair_secret,
+            "peer_node_id": invite.creator_node_id,
+            "peer_public_key": invite.creator_public_key,
+            "peer_x25519_public_key": invite.creator_x25519_public_key,
+            "local_x25519_public_key": x25519_identity.public_key,
+            "joined_by": identity.node_id,
+            "joined_at": round(time.time(), 3),
+            "expires_at": invite.expires_at,
+            "safety_phrase": phrase,
+            "verified": False,
+            "disabled": False,
+            "processed_message_ids": [],
+        },
+        home,
+    )
+    hello_response = RelayClient(invite.relay_url).post_envelope(
+        room_id=invite.room_id,
+        relay_token=invite.relay_token,
+        envelope=create_pair_hello(room_id=invite.room_id, sender=identity, x25519_public_key=x25519_identity.public_key),
+    )
+    result = {
+        "schema": "gremlinchat.trial-guest.v1",
+        "joined": True,
+        "room_id": invite.room_id,
+        "relay_url": invite.relay_url,
+        "peer_node_id": invite.creator_node_id,
+        "safety_phrase": phrase,
+        "hello_posted": hello_response.get("accepted") is True,
+        "next_steps": [
+            "Compare this safety phrase with the host out of band.",
+            "Run gremlinchat room verify --phrase <phrase> only if both sides match.",
+            "After both sides verify, run gremlinchat room loop so the host can run gremlinchat trial prove.",
+        ],
+    }
+    append_audit_event(home, {"event_type": "trial.guest_invite_accepted", "room_id": invite.room_id, "peer_node_id": invite.creator_node_id, "hello_response": hello_response})
+    return result
+
+
+def run_live_read_only_proof(
+    home: Path,
+    *,
+    room_id: str | None = None,
+    timeout_seconds: float = 30.0,
+    poll_interval: float = 2.0,
+    write_report: bool = True,
+    process_once: Callable[[], Any] | None = None,
+) -> dict[str, Any]:
+    home = ensure_home(home)
+    started_at = round(time.time(), 3)
+    sent = [request_runbook(home, room_id, runbook, {}) for runbook in TRIAL_RUNBOOKS]
+    expected = {item["task_id"]: runbook for item, runbook in zip(sent, TRIAL_RUNBOOKS, strict=True)}
+    results: dict[str, dict[str, Any]] = {}
+    deadline = time.monotonic() + timeout_seconds
+    syncs = []
+    while time.monotonic() <= deadline and len(results) < len(expected):
+        if process_once is not None:
+            process_once()
+        sync = sync_room_messages(home, room_id)
+        syncs.append({"message_count": sync["message_count"], "decrypted_count": len(sync["decrypted_messages"])})
+        for message in sync["decrypted_messages"]:
+            if message.get("type") != "task.result.v1":
+                continue
+            task_id = str(message.get("task_id", ""))
+            if task_id in expected:
+                results[task_id] = message
+        if len(results) >= len(expected):
+            break
+        if poll_interval > 0:
+            time.sleep(poll_interval)
+    runbook_results = []
+    for task_id, runbook in expected.items():
+        message = results.get(task_id)
+        result = {} if message is None else dict(message.get("result", {}))
+        runbook_results.append(
+            {
+                "runbook": runbook,
+                "task_id": task_id,
+                "result_status": result.get("status", "missing"),
+                "result_accepted": bool(result.get("accepted", False)),
+                "summary": result.get("summary", "No result returned before timeout."),
+            }
+        )
+    ok = len(results) == len(expected) and all(item["result_accepted"] for item in runbook_results)
+    report = {
+        "schema": "gremlinchat.live-readonly-proof.v1",
+        "ok": ok,
+        "summary": "Live read-only proof completed." if ok else "Live read-only proof did not receive every expected result.",
+        "started_at": started_at,
+        "completed_at": round(time.time(), 3),
+        "timeout_seconds": timeout_seconds,
+        "read_only_runbooks": TRIAL_RUNBOOKS,
+        "sent_tasks": sent,
+        "runbook_results": runbook_results,
+        "syncs": syncs,
+    }
+    if write_report:
+        report["report_paths"] = write_trial_report(home, report)
+    append_audit_event(home, {"event_type": "trial.live_readonly_proof", "ok": ok, "runbook_results": runbook_results})
+    return report
 
 
 def run_preflight(

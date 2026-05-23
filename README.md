@@ -69,6 +69,36 @@ Check readiness:
 gremlinchat trial preflight --relay http://YOUR_LAN_OR_TAILSCALE_IP:8778 --write-report
 ```
 
+Host creates the private invite:
+
+```powershell
+gremlinchat trial host --relay http://YOUR_LAN_OR_TAILSCALE_IP:8778
+```
+
+Guest joins with the invite code shared privately:
+
+```powershell
+gremlinchat trial guest GC1:...
+```
+
+Both sides compare the safety phrase by phone or another trusted channel, then each runs:
+
+```powershell
+gremlinchat room verify --phrase WORD-WORD-WORD-WORD
+```
+
+Guest keeps their machine listening for read-only proof requests:
+
+```powershell
+gremlinchat room loop
+```
+
+Host runs the read-only proof and writes a redacted report:
+
+```powershell
+gremlinchat trial prove
+```
+
 Run a one-machine proof before involving another person:
 
 ```powershell

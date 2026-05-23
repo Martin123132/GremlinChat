@@ -4,8 +4,10 @@ from urllib.request import Request, urlopen
 
 from gremlinchat.crypto import NodeIdentity, X25519Identity
 from gremlinchat.daemon import create_daemon_http_server
+from gremlinchat.relay import create_relay_http_server
+from gremlinchat.roomops import process_room_once, sync_room_messages, verify_room
 from gremlinchat.store import load_policy, save_room
-from gremlinchat.trial import run_trial_simulation, write_trial_report
+from gremlinchat.trial import accept_trial_invite, create_trial_invite, run_live_read_only_proof, run_trial_simulation, write_trial_report
 
 
 def _post_json(url):
@@ -37,6 +39,38 @@ def test_trial_report_redacts_public_unsafe_values(tmp_path):
 
     assert "secret-token" not in open(paths["json"], encoding="utf-8").read()
     assert "Bearer " not in open(paths["markdown"], encoding="utf-8").read()
+
+
+def test_live_trial_host_guest_and_proof(tmp_path):
+    server = create_relay_http_server(host="127.0.0.1", port=0, state_dir=tmp_path / "relay")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    alice_home = tmp_path / "alice"
+    bob_home = tmp_path / "bob"
+    try:
+        host_packet = create_trial_invite(alice_home, relay_url=f"http://{host}:{port}")
+        guest_packet = accept_trial_invite(bob_home, host_packet["invite_code"])
+        alice_sync = sync_room_messages(alice_home, host_packet["room_id"])
+        verify_room(alice_home, host_packet["room_id"], alice_sync["safety_phrase"])
+        verify_room(bob_home, host_packet["room_id"], guest_packet["safety_phrase"])
+
+        proof = run_live_read_only_proof(
+            alice_home,
+            room_id=host_packet["room_id"],
+            timeout_seconds=3,
+            poll_interval=0,
+            write_report=False,
+            process_once=lambda: process_room_once(bob_home, host_packet["room_id"]),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert proof["ok"] is True
+    assert {item["runbook"] for item in proof["runbook_results"]} == {"presence.ping", "machine.status", "gremlinchat.doctor"}
+    assert all(item["result_accepted"] for item in proof["runbook_results"])
 
 
 def test_dashboard_revoke_and_emergency_stop_posts(tmp_path):
