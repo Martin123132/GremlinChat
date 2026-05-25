@@ -46,7 +46,7 @@ def require_room_verified(room: dict[str, Any]) -> None:
     if room.get("disabled"):
         raise GremlinChatError("Room is disabled. Run room verify again only after confirming consent.")
     if not room.get("verified"):
-        raise GremlinChatError("Room is not verified. Compare the safety phrase with the other person, then run gremlinchat room verify --phrase <phrase>.")
+        raise GremlinChatError("Room is not verified. Compare the safety phrase with the other person, then run gremlinchat pair verify --phrase <phrase>.")
     if not room.get("peer_node_id") or not room.get("peer_public_key") or not room.get("peer_x25519_public_key"):
         raise GremlinChatError("Room is missing peer identity. Run gremlinchat room sync before verification.")
 
@@ -62,11 +62,26 @@ def sync_room_messages(home: Path, room_id: str | None) -> dict[str, Any]:
         envelope = record["envelope"]
         if envelope.get("protocol") == "gremlinchat.pair-hello.v1":
             if envelope.get("sender_node_id") != identity.node_id and verify_pair_hello(envelope):
-                room["peer_node_id"] = envelope["sender_node_id"]
-                room["peer_public_key"] = envelope["sender_public_key"]
-                room["peer_x25519_public_key"] = envelope["x25519_public_key"]
-                room["safety_phrase"] = safety_phrase(room["pair_secret"], [identity.public_key, envelope["sender_public_key"]])
-                updated = True
+                peer_changed = (
+                    room.get("peer_node_id") != envelope["sender_node_id"]
+                    or room.get("peer_public_key") != envelope["sender_public_key"]
+                    or room.get("peer_x25519_public_key") != envelope["x25519_public_key"]
+                )
+                if peer_changed:
+                    room["peer_node_id"] = envelope["sender_node_id"]
+                    room["peer_public_key"] = envelope["sender_public_key"]
+                    room["peer_x25519_public_key"] = envelope["x25519_public_key"]
+                    room["safety_phrase"] = safety_phrase(room["pair_secret"], [identity.public_key, envelope["sender_public_key"]])
+                    updated = True
+                    append_audit_event(home, {"event_type": "pairing.peer_joined", "room_id": room["room_id"], "peer_node_id": room.get("peer_node_id")})
+                    create_receipt(
+                        home,
+                        event_type="pairing.peer_joined",
+                        status="joined",
+                        room_id=room["room_id"],
+                        dedupe_key=f"pairing.peer_joined:{room['room_id']}:{room.get('peer_node_id')}",
+                        evidence={"room_id": room["room_id"], "peer_node_id": room.get("peer_node_id"), "safety_phrase": room.get("safety_phrase")},
+                    )
             continue
         if envelope.get("sender_node_id") == identity.node_id or "peer_x25519_public_key" not in room:
             continue
@@ -121,6 +136,14 @@ def verify_room(home: Path, room_id: str | None, phrase: str) -> dict[str, Any]:
         room_id=room["room_id"],
         dedupe_key=f"room.verified:{room['room_id']}:{room.get('peer_node_id')}:{room['verified_at']}",
         evidence={"room_id": room["room_id"], "peer_node_id": room.get("peer_node_id"), "verified_at": room["verified_at"]},
+    )
+    create_receipt(
+        home,
+        event_type="pairing.room_enabled",
+        status="enabled",
+        room_id=room["room_id"],
+        dedupe_key=f"pairing.room_enabled:{room['room_id']}:{room.get('peer_node_id')}:{room['verified_at']}",
+        evidence={"room_id": room["room_id"], "peer_node_id": room.get("peer_node_id"), "verified_at": room["verified_at"], "safety_phrase": expected},
     )
     return {"verified": True, "room_id": room["room_id"], "safety_phrase": expected}
 

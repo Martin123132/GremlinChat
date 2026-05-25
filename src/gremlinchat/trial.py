@@ -16,11 +16,11 @@ from typing import Any, Callable
 from urllib.error import URLError
 from urllib.request import urlopen
 
-from .crypto import create_invite_code, parse_invite_code, protect_secret, safety_phrase, unprotect_secret
-from .messages import create_pair_hello
+from .crypto import parse_invite_code, protect_secret, unprotect_secret
+from .pairing import pair_host, pair_join
 from .redaction import redact_value
 from .receipts import compare_receipts, create_receipt, receipt_status
-from .relay import RelayClient, create_relay_http_server
+from .relay import create_relay_http_server
 from .roomops import GremlinChatError, process_room_once, request_runbook, revoke_room, sync_room_messages, verify_room
 from .runbooks import READ_RUNBOOKS, runbook_catalog
 from .store import (
@@ -33,7 +33,6 @@ from .store import (
     load_rooms,
     read_audit_events,
     save_policy,
-    save_room,
 )
 
 
@@ -43,99 +42,43 @@ RESET_CONFIRMATION = "RESET-GREMLINCHAT-TRIAL"
 
 def create_trial_invite(home: Path, *, relay_url: str, ttl_seconds: int = 600) -> dict[str, Any]:
     home = ensure_home(home)
-    identity = load_or_create_identity(home)
-    x25519_identity = load_or_create_x25519_identity(home)
-    room_response = RelayClient(relay_url).create_room(ttl_seconds=ttl_seconds)
-    if "room_id" not in room_response:
-        raise GremlinChatError(f"relay room creation failed: {room_response}")
-    invite_code = create_invite_code(
-        creator=identity,
-        creator_x25519_public_key=x25519_identity.public_key,
-        relay_url=relay_url,
-        room_id=room_response["room_id"],
-        relay_token=room_response["relay_token"],
-        ttl_seconds=ttl_seconds,
-    )
-    invite = parse_invite_code(invite_code)
-    save_room(
-        {
-            "room_id": invite.room_id,
-            "relay_url": invite.relay_url,
-            "relay_token": invite.relay_token,
-            "pair_secret": invite.pair_secret,
-            "local_x25519_public_key": x25519_identity.public_key,
-            "created_by": identity.node_id,
-            "created_at": round(time.time(), 3),
-            "expires_at": invite.expires_at,
-            "verified": False,
-            "disabled": False,
-            "processed_message_ids": [],
-        },
-        home,
-    )
+    pairing = pair_host(home, relay_url=relay_url, ttl_seconds=ttl_seconds, read_only_lock=True)
     result = {
         "schema": "gremlinchat.trial-host.v1",
-        "room_id": invite.room_id,
-        "relay_url": invite.relay_url,
-        "expires_at": invite.expires_at,
-        "invite_code": invite_code,
+        "room_id": pairing["room_id"],
+        "relay_url": pairing["relay_url"],
+        "expires_at": pairing["expires_at"],
+        "invite_code": pairing["invite_code"],
+        "host_hello_posted": pairing["host_hello_posted"],
         "next_steps": [
             "Share the invite code privately.",
             "Ask the guest to run gremlinchat trial guest GC1:...",
-            "Run gremlinchat room sync, compare the safety phrase out of band, then run gremlinchat room verify --phrase <phrase>.",
+            "Run gremlinchat room sync, compare the safety phrase out of band, then run gremlinchat pair verify --phrase <phrase>.",
             "After both sides verify, ask the guest to run gremlinchat trial listen and run gremlinchat trial prove.",
         ],
     }
-    append_audit_event(home, {"event_type": "trial.host_invite_created", "room_id": invite.room_id, "relay_url": invite.relay_url, "expires_at": invite.expires_at})
+    append_audit_event(home, {"event_type": "trial.host_invite_created", "room_id": pairing["room_id"], "relay_url": pairing["relay_url"], "expires_at": pairing["expires_at"]})
     return result
 
 
 def accept_trial_invite(home: Path, code: str) -> dict[str, Any]:
     home = ensure_home(home)
-    identity = load_or_create_identity(home)
-    x25519_identity = load_or_create_x25519_identity(home)
-    invite = parse_invite_code(code)
-    phrase = safety_phrase(invite.pair_secret, [invite.creator_public_key, identity.public_key])
-    save_room(
-        {
-            "room_id": invite.room_id,
-            "relay_url": invite.relay_url,
-            "relay_token": invite.relay_token,
-            "pair_secret": invite.pair_secret,
-            "peer_node_id": invite.creator_node_id,
-            "peer_public_key": invite.creator_public_key,
-            "peer_x25519_public_key": invite.creator_x25519_public_key,
-            "local_x25519_public_key": x25519_identity.public_key,
-            "joined_by": identity.node_id,
-            "joined_at": round(time.time(), 3),
-            "expires_at": invite.expires_at,
-            "safety_phrase": phrase,
-            "verified": False,
-            "disabled": False,
-            "processed_message_ids": [],
-        },
-        home,
-    )
-    hello_response = RelayClient(invite.relay_url).post_envelope(
-        room_id=invite.room_id,
-        relay_token=invite.relay_token,
-        envelope=create_pair_hello(room_id=invite.room_id, sender=identity, x25519_public_key=x25519_identity.public_key),
-    )
+    pairing = pair_join(home, code, read_only_lock=True)
     result = {
         "schema": "gremlinchat.trial-guest.v1",
         "joined": True,
-        "room_id": invite.room_id,
-        "relay_url": invite.relay_url,
-        "peer_node_id": invite.creator_node_id,
-        "safety_phrase": phrase,
-        "hello_posted": hello_response.get("accepted") is True,
+        "room_id": pairing["room_id"],
+        "relay_url": pairing["relay_url"],
+        "peer_node_id": pairing["peer_node_id"],
+        "safety_phrase": pairing["safety_phrase"],
+        "hello_posted": pairing["hello_posted"],
         "next_steps": [
             "Compare this safety phrase with the host out of band.",
-            "Run gremlinchat room verify --phrase <phrase> only if both sides match.",
+            "Run gremlinchat pair verify --phrase <phrase> only if both sides match.",
             "After both sides verify, run gremlinchat trial listen so the host can run gremlinchat trial prove.",
         ],
     }
-    append_audit_event(home, {"event_type": "trial.guest_invite_accepted", "room_id": invite.room_id, "peer_node_id": invite.creator_node_id, "hello_response": hello_response})
+    append_audit_event(home, {"event_type": "trial.guest_invite_accepted", "room_id": pairing["room_id"], "peer_node_id": pairing["peer_node_id"], "hello_posted": pairing["hello_posted"]})
     return result
 
 
@@ -345,7 +288,7 @@ def build_trial_checklist(home: Path, *, role: str, relay_url: str | None = None
         elif unverified_rooms:
             commands.append("gremlinchat room sync")
             phrase = str(unverified_rooms[0].get("safety_phrase") or "WORD-WORD-WORD-WORD")
-            commands.append(f"gremlinchat room verify --phrase {phrase}")
+            commands.append(f"gremlinchat pair verify --phrase {phrase}")
             next_steps.append("Compare the safety phrase out of band before running verify.")
         elif verified_rooms:
             commands.append("gremlinchat trial prove")
@@ -360,7 +303,7 @@ def build_trial_checklist(home: Path, *, role: str, relay_url: str | None = None
             next_steps.append("Paste only an invite code received privately from the host.")
         elif unverified_rooms:
             phrase = str(unverified_rooms[0].get("safety_phrase") or "WORD-WORD-WORD-WORD")
-            commands.append(f"gremlinchat room verify --phrase {phrase}")
+            commands.append(f"gremlinchat pair verify --phrase {phrase}")
             next_steps.append("Compare this safety phrase with the host out of band before verifying.")
         elif verified_rooms:
             commands.append("gremlinchat trial listen")
@@ -604,71 +547,20 @@ def current_trial_snapshot(home: Path) -> dict[str, Any]:
 
 
 def _simulate_pairing_and_read_only_runbooks(alice_home: Path, bob_home: Path, relay_url: str) -> dict[str, Any]:
+    host_packet = pair_host(alice_home, relay_url=relay_url, ttl_seconds=600)
+    guest_packet = pair_join(bob_home, host_packet["invite_code"])
+    room_id = str(host_packet["room_id"])
     alice = load_or_create_identity(alice_home)
-    alice_x = load_or_create_x25519_identity(alice_home)
     bob = load_or_create_identity(bob_home)
-    bob_x = load_or_create_x25519_identity(bob_home)
-    room_response = RelayClient(relay_url).create_room(ttl_seconds=600)
-    invite_code = create_invite_code(
-        creator=alice,
-        creator_x25519_public_key=alice_x.public_key,
-        relay_url=relay_url,
-        room_id=room_response["room_id"],
-        relay_token=room_response["relay_token"],
-        ttl_seconds=600,
-    )
-    invite = parse_invite_code(invite_code)
-    save_room(
-        {
-            "room_id": invite.room_id,
-            "relay_url": invite.relay_url,
-            "relay_token": invite.relay_token,
-            "pair_secret": invite.pair_secret,
-            "local_x25519_public_key": alice_x.public_key,
-            "created_by": alice.node_id,
-            "created_at": round(time.time(), 3),
-            "expires_at": invite.expires_at,
-            "verified": False,
-            "disabled": False,
-            "processed_message_ids": [],
-        },
-        alice_home,
-    )
-    phrase = safety_phrase(invite.pair_secret, [invite.creator_public_key, bob.public_key])
-    save_room(
-        {
-            "room_id": invite.room_id,
-            "relay_url": invite.relay_url,
-            "relay_token": invite.relay_token,
-            "pair_secret": invite.pair_secret,
-            "peer_node_id": invite.creator_node_id,
-            "peer_public_key": invite.creator_public_key,
-            "peer_x25519_public_key": invite.creator_x25519_public_key,
-            "local_x25519_public_key": bob_x.public_key,
-            "joined_by": bob.node_id,
-            "joined_at": round(time.time(), 3),
-            "expires_at": invite.expires_at,
-            "safety_phrase": phrase,
-            "verified": False,
-            "disabled": False,
-            "processed_message_ids": [],
-        },
-        bob_home,
-    )
-    RelayClient(invite.relay_url).post_envelope(
-        room_id=invite.room_id,
-        relay_token=invite.relay_token,
-        envelope=create_pair_hello(room_id=invite.room_id, sender=bob, x25519_public_key=bob_x.public_key),
-    )
-    alice_sync = sync_room_messages(alice_home, invite.room_id)
-    verify_room(alice_home, invite.room_id, str(alice_sync["safety_phrase"]))
-    verify_room(bob_home, invite.room_id, phrase)
+    alice_sync = sync_room_messages(alice_home, room_id)
+    verify_room(alice_home, room_id, str(alice_sync["safety_phrase"]))
+    verify_room(bob_home, room_id, str(guest_packet["safety_phrase"]))
 
     runbook_results = []
     for runbook in TRIAL_RUNBOOKS:
-        request = request_runbook(alice_home, invite.room_id, runbook, {})
-        processed = process_room_once(bob_home, invite.room_id)
-        synced = sync_room_messages(alice_home, invite.room_id)
+        request = request_runbook(alice_home, room_id, runbook, {})
+        processed = process_room_once(bob_home, room_id)
+        synced = sync_room_messages(alice_home, room_id)
         result_messages = [message for message in synced["decrypted_messages"] if message.get("type") == "task.result.v1" and message.get("task_id") == request["task_id"]]
         runbook_results.append(
             {
@@ -680,10 +572,10 @@ def _simulate_pairing_and_read_only_runbooks(alice_home: Path, bob_home: Path, r
             }
         )
 
-    revoke = revoke_room(alice_home, invite.room_id)
+    revoke = revoke_room(alice_home, room_id)
     blocked_after_revoke = False
     try:
-        request_runbook(alice_home, invite.room_id, "presence.ping", {})
+        request_runbook(alice_home, room_id, "presence.ping", {})
     except GremlinChatError:
         blocked_after_revoke = True
 
@@ -696,7 +588,7 @@ def _simulate_pairing_and_read_only_runbooks(alice_home: Path, bob_home: Path, r
         "relay_url": relay_url,
         "alice_node_id": alice.node_id,
         "bob_node_id": bob.node_id,
-        "room_id": invite.room_id,
+        "room_id": room_id,
         "safety_phrase": alice_sync["safety_phrase"],
         "read_only_runbooks": TRIAL_RUNBOOKS,
         "available_read_runbooks": sorted(READ_RUNBOOKS),
@@ -757,14 +649,14 @@ def _session_next_steps(role: str, checklist: dict[str, Any], **flags: Any) -> l
     if role == "host" and flags.get("created_invite"):
         return [
             "Share invite_packet.invite_code privately with the guest.",
-            "After the guest joins, run gremlinchat room sync.",
+            "After the guest joins, run gremlinchat room sync or gremlinchat pair status.",
             "Compare the safety phrase out of band and verify only if both sides match.",
             "Ask the guest to run gremlinchat trial listen, then run gremlinchat trial prove.",
         ]
     if role == "guest" and flags.get("joined"):
         return [
             "Compare join_packet.safety_phrase with the host out of band.",
-            "Run gremlinchat room verify --phrase <phrase> only if both sides match.",
+            "Run gremlinchat pair verify --phrase <phrase> only if both sides match.",
             "Run gremlinchat trial listen while the host runs gremlinchat trial prove.",
         ]
     return list(checklist.get("next_steps", []))

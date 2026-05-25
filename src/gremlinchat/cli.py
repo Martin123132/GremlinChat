@@ -7,14 +7,9 @@ import json
 import time
 from pathlib import Path
 
-from .crypto import (
-    parse_invite_code,
-    safety_phrase,
-    create_invite_code,
-)
 from .daemon import create_daemon_http_server
 from .install import run_install_doctor, write_install_doctor_report
-from .messages import create_pair_hello
+from .pairing import pair_host, pair_join, pair_status, pair_verify
 from .receipts import (
     compare_receipts,
     create_receipt,
@@ -27,7 +22,7 @@ from .receipts import (
     verify_receipt_file,
     write_receipt_bundle,
 )
-from .relay import RelayClient, create_relay_http_server
+from .relay import create_relay_http_server
 from .roomops import (
     GremlinChatError,
     disable_room as disable_room_state,
@@ -52,9 +47,7 @@ from .store import (
     load_or_create_identity,
     load_or_create_x25519_identity,
     load_policy,
-    load_rooms,
     save_policy,
-    save_room,
 )
 from .trial import (
     RESET_CONFIRMATION,
@@ -122,98 +115,46 @@ def serve_daemon(args: argparse.Namespace) -> None:
 
 
 def create_room(args: argparse.Namespace) -> None:
-    home = _home(args.home)
-    identity = load_or_create_identity(home)
-    x25519_identity = load_or_create_x25519_identity(home)
-    room_response = RelayClient(args.relay).create_room(ttl_seconds=args.ttl_seconds)
-    if "room_id" not in room_response:
-        raise SystemExit(f"relay room creation failed: {room_response}")
-    invite_code = create_invite_code(
-        creator=identity,
-        creator_x25519_public_key=x25519_identity.public_key,
-        relay_url=args.relay,
-        room_id=room_response["room_id"],
-        relay_token=room_response["relay_token"],
-        ttl_seconds=args.ttl_seconds,
-    )
-    invite = parse_invite_code(invite_code)
-    save_room(
-        {
-            "room_id": invite.room_id,
-            "relay_url": invite.relay_url,
-            "relay_token": invite.relay_token,
-            "pair_secret": invite.pair_secret,
-            "local_x25519_public_key": x25519_identity.public_key,
-            "created_by": identity.node_id,
-            "created_at": round(time.time(), 3),
-            "expires_at": invite.expires_at,
-            "verified": False,
-            "disabled": False,
-            "processed_message_ids": [],
-        },
-        home,
-    )
-    print(
-        json.dumps(
-            {
-                "room_id": invite.room_id,
-                "relay_url": invite.relay_url,
-                "expires_at": invite.expires_at,
-                "invite_code": invite_code,
-                "note": "Share privately. Do not commit invite codes. Run room sync, compare the safety phrase by phone/email, then run room verify.",
-            },
-            indent=2,
-            sort_keys=True,
-        )
-    )
+    try:
+        result = pair_host(_home(args.home), relay_url=args.relay, ttl_seconds=args.ttl_seconds, read_only_lock=False)
+    except GremlinChatError as exc:
+        raise SystemExit(str(exc)) from exc
+    result["note"] = "Share privately. Do not commit invite codes. Run room sync, compare the safety phrase by phone/email, then run pair verify."
+    print(json.dumps(result, indent=2, sort_keys=True))
 
 
 def join_room(args: argparse.Namespace) -> None:
-    home = _home(args.home)
-    identity = load_or_create_identity(home)
-    x25519_identity = load_or_create_x25519_identity(home)
-    invite = parse_invite_code(args.code)
-    phrase = safety_phrase(invite.pair_secret, [invite.creator_public_key, identity.public_key])
-    save_room(
-        {
-            "room_id": invite.room_id,
-            "relay_url": invite.relay_url,
-            "relay_token": invite.relay_token,
-            "pair_secret": invite.pair_secret,
-            "peer_node_id": invite.creator_node_id,
-            "peer_public_key": invite.creator_public_key,
-            "peer_x25519_public_key": invite.creator_x25519_public_key,
-            "local_x25519_public_key": x25519_identity.public_key,
-            "joined_by": identity.node_id,
-            "joined_at": round(time.time(), 3),
-            "expires_at": invite.expires_at,
-            "safety_phrase": phrase,
-            "verified": False,
-            "disabled": False,
-            "processed_message_ids": [],
-        },
-        home,
-    )
-    hello_response = RelayClient(invite.relay_url).post_envelope(
-        room_id=invite.room_id,
-        relay_token=invite.relay_token,
-        envelope=create_pair_hello(room_id=invite.room_id, sender=identity, x25519_public_key=x25519_identity.public_key),
-    )
-    print(
-        json.dumps(
-            {
-                "joined": True,
-                "room_id": invite.room_id,
-                "relay_url": invite.relay_url,
-                "peer_node_id": invite.creator_node_id,
-                "safety_phrase": phrase,
-                "hello_posted": hello_response.get("accepted") is True,
-                "next_step": "Compare this safety phrase with the other person, then run room verify locally.",
-            },
-            indent=2,
-            sort_keys=True,
-        )
-    )
+    try:
+        result = pair_join(_home(args.home), args.code, read_only_lock=False)
+    except (GremlinChatError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+    result["next_step"] = "Compare this safety phrase with the other person, then run pair verify locally."
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def pair_host_command(args: argparse.Namespace) -> None:
+    try:
+        print(json.dumps(pair_host(_home(args.home), relay_url=args.relay, ttl_seconds=args.ttl_seconds), indent=2, sort_keys=True))
+    except GremlinChatError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def pair_join_command(args: argparse.Namespace) -> None:
+    try:
+        print(json.dumps(pair_join(_home(args.home), args.code), indent=2, sort_keys=True))
+    except (GremlinChatError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def pair_verify_command(args: argparse.Namespace) -> None:
+    try:
+        print(json.dumps(pair_verify(_home(args.home), room_id=args.room_id, phrase=args.phrase), indent=2, sort_keys=True))
+    except GremlinChatError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def pair_status_command(args: argparse.Namespace) -> None:
+    print(json.dumps(pair_status(_home(args.home), include_invite=args.show_invite), indent=2, sort_keys=True))
 
 
 def sync_room(args: argparse.Namespace) -> None:
@@ -598,6 +539,23 @@ def build_parser() -> argparse.ArgumentParser:
     relay_serve.add_argument("--max-envelope-bytes", default=128 * 1024, type=int, help="Reject encrypted envelopes above this size.")
     relay_serve.add_argument("--max-messages-per-room", default=1000, type=int, help="Reject new messages after this many room messages.")
     relay_serve.set_defaults(func=serve_relay)
+
+    pair_parser = subcommands.add_parser("pair", help="Guided first-run pairing ceremony")
+    pair_subcommands = pair_parser.add_subparsers(dest="pair_command", required=True)
+    pair_host_parser = pair_subcommands.add_parser("host", help="Create a private invite and register this host with the relay")
+    pair_host_parser.add_argument("--relay", required=True, help="Relay URL, such as http://100.x.y.z:8778")
+    pair_host_parser.add_argument("--ttl-seconds", default=600, type=int)
+    pair_host_parser.set_defaults(func=pair_host_command)
+    pair_join_parser = pair_subcommands.add_parser("join", help="Join from a GC1 invite and post a signed pairing hello")
+    pair_join_parser.add_argument("code")
+    pair_join_parser.set_defaults(func=pair_join_command)
+    pair_verify_parser = pair_subcommands.add_parser("verify", help="Enable a room after comparing the safety phrase out of band")
+    pair_verify_parser.add_argument("--room-id", default=None)
+    pair_verify_parser.add_argument("--phrase", required=True)
+    pair_verify_parser.set_defaults(func=pair_verify_command)
+    pair_status_parser = pair_subcommands.add_parser("status", help="Show pairing ceremony state and next commands")
+    pair_status_parser.add_argument("--show-invite", action="store_true", help="Show the latest unexpired local invite code")
+    pair_status_parser.set_defaults(func=pair_status_command)
 
     room_parser = subcommands.add_parser("room", help="Pairing room commands")
     room_subcommands = room_parser.add_subparsers(dest="room_command", required=True)

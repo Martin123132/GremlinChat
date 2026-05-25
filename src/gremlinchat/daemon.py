@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
 
+from .pairing import pair_host, pair_join, pair_status, pair_verify
 from .receipts import compare_receipts, create_receipt, receipt_status, write_receipt_bundle
 from .roomops import GremlinChatError, disable_room, process_room_once, request_runbook, revoke_room, sync_room_messages
 from .runbooks import runbook_catalog
@@ -40,6 +41,10 @@ def create_daemon_http_server(home: Path, host: str = "127.0.0.1", port: int = 8
                 query = parse_qs(parsed.query)
                 with lock:
                     _json_response(self, 200, trial_status(home, relay_url=query.get("relay", [None])[0]))
+                return
+            if parsed.path == "/api/pair/status":
+                with lock:
+                    _json_response(self, 200, pair_status(home))
                 return
             if parsed.path == "/api/trial/checklist":
                 query = parse_qs(parsed.query)
@@ -78,6 +83,35 @@ def create_daemon_http_server(home: Path, host: str = "127.0.0.1", port: int = 8
                 query = parse_qs(parsed.query)
                 with lock:
                     _action_response(self, parsed, {"ok": True, "bundle_paths": write_receipt_bundle(home, room_id=query.get("room_id", [None])[0])})
+                return
+            if parsed.path == "/api/pair/host":
+                values = _request_values(self, parsed)
+                relay = values.get("relay", [""])[0] or "http://127.0.0.1:8778"
+                ttl_seconds = int(values.get("ttl_seconds", ["600"])[0] or "600")
+                try:
+                    with lock:
+                        _action_response(self, parsed, {"ok": True, "pairing": pair_host(home, relay_url=relay, ttl_seconds=ttl_seconds)})
+                except GremlinChatError as exc:
+                    _json_response(self, 400, {"ok": False, "error": str(exc)})
+                return
+            if parsed.path == "/api/pair/join":
+                values = _request_values(self, parsed)
+                code = values.get("code", [""])[0]
+                try:
+                    with lock:
+                        _action_response(self, parsed, {"ok": True, "pairing": pair_join(home, code)})
+                except (GremlinChatError, ValueError) as exc:
+                    _json_response(self, 400, {"ok": False, "error": str(exc)})
+                return
+            if parsed.path == "/api/pair/verify":
+                values = _request_values(self, parsed)
+                room_id = values.get("room_id", [""])[0] or None
+                phrase = values.get("phrase", [""])[0]
+                try:
+                    with lock:
+                        _action_response(self, parsed, {"ok": True, "pairing": pair_verify(home, room_id=room_id, phrase=phrase)})
+                except GremlinChatError as exc:
+                    _json_response(self, 400, {"ok": False, "error": str(exc)})
                 return
             if parsed.path == "/api/trial/bundle":
                 query = parse_qs(parsed.query)
@@ -148,6 +182,7 @@ def _snapshot(home: Path, *, include_csrf: bool = False) -> dict[str, Any]:
         "policy": runbook_catalog(policy),
         "approvals": load_approvals(home),
         "audit": read_audit_events(home, limit=25),
+        "pairing": pair_status(home, include_invite=include_csrf),
         "trial": trial_status(home),
         "receipts": receipt_status(home),
     }
@@ -169,8 +204,10 @@ def _render_dashboard(snapshot: dict[str, Any]) -> str:
     home = html.escape(snapshot["home"])
     csrf = quote(str(snapshot.get("csrf_token", "")), safe="")
     policy = snapshot["policy"]
+    pairing = snapshot["pairing"]
     pending = [approval for approval in snapshot["approvals"] if approval.get("status") == "pending"]
     room_rows = "\n".join(_room_row(room, csrf) for room in snapshot["rooms"]) or "<tr><td colspan=\"6\" class=\"empty\">No paired rooms yet.</td></tr>"
+    pairing_panel = _pairing_panel(pairing, csrf)
     trial = snapshot["trial"]
     trial_rows = _trial_rows(trial)
     receipt_rows = _receipt_rows(snapshot["receipts"])
@@ -210,9 +247,14 @@ def _render_dashboard(snapshot: dict[str, Any]) -> str:
     code {{ font-family:Consolas, "Liberation Mono", monospace; font-size:12px; }}
     .state {{ display:inline-block; min-width:72px; padding:4px 8px; border-radius:999px; background:{'#a13d35' if policy['emergency_stop'] else '#24734d'}; color:#fff; text-align:center; font-size:12px; }}
     .empty {{ color:var(--muted); }}
+    input, textarea {{ width:100%; min-width:180px; padding:7px 9px; border:1px solid var(--line); border-radius:6px; font:inherit; }}
+    textarea {{ min-height:76px; font-family:Consolas, "Liberation Mono", monospace; font-size:12px; resize:vertical; }}
     button {{ margin:2px 0; padding:6px 10px; border:1px solid var(--line); border-radius:6px; background:#fff; cursor:pointer; }}
     .actions {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:12px; }}
     .actions a {{ display:inline-block; padding:6px 10px; border:1px solid var(--line); border-radius:6px; color:var(--text); text-decoration:none; background:#fff; }}
+    .pair-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:12px; margin-top:12px; }}
+    .pair-grid form {{ display:grid; gap:8px; }}
+    .hint {{ color:var(--muted); font-size:12px; margin-top:6px; }}
   </style>
 </head>
 <body>
@@ -225,6 +267,7 @@ def _render_dashboard(snapshot: dict[str, Any]) -> str:
       <div class="metric"><span>Pending Approvals</span><strong>{len(pending)}</strong></div>
       <div class="metric"><span>Write Runbooks</span><strong>{len(policy["enabled_write_runbooks"])}</strong></div>
     </div>
+    <section><h2>Pairing Ceremony</h2>{pairing_panel}</section>
     <section><h2>Trial</h2><table><thead><tr><th>Check</th><th>Status</th><th>Detail</th></tr></thead><tbody>{trial_rows}</tbody></table><div class="actions"><a href="/api/trial/checklist?role=host">Checklist</a><form method="post" action="/api/trial/bundle?redirect=1&csrf={csrf}"><button>Bundle</button></form><form method="post" action="/api/emergency-stop?redirect=1&csrf={csrf}"><button>Emergency Stop</button></form></div></section>
     <section><h2>Trust Receipts</h2><table><thead><tr><th>Receipt</th><th>Source</th><th>Issuer</th><th>Event</th><th>Status</th></tr></thead><tbody>{receipt_rows}</tbody></table><div class="actions"><a href="/api/receipts/status">Status</a><a href="/api/receipts/compare">Compare</a><form method="post" action="/api/receipts/bundle?redirect=1&csrf={csrf}"><button>Bundle</button></form></div><table><thead><tr><th>Comparison</th><th>Count</th><th>Meaning</th></tr></thead><tbody>{receipt_compare_rows}</tbody></table></section>
     <section><h2>Rooms</h2><table><thead><tr><th>Room</th><th>Relay</th><th>Partner</th><th>State</th><th>Safety Phrase</th><th>Actions</th></tr></thead><tbody>{room_rows}</tbody></table></section>
@@ -233,6 +276,46 @@ def _render_dashboard(snapshot: dict[str, Any]) -> str:
   </main>
 </body>
 </html>"""
+
+
+def _pairing_panel(pairing: dict[str, Any], csrf: str) -> str:
+    latest = pairing.get("latest_invite") or {}
+    invite_code = str(latest.get("invite_code") or "")
+    invite_html = ""
+    if invite_code:
+        invite_html = (
+            "<div>"
+            "<label>Latest private invite</label>"
+            f"<textarea readonly>{html.escape(invite_code)}</textarea>"
+            f"<div class=\"hint\">Expires in {html.escape(str(latest.get('expires_in_seconds', 0)))} seconds. Share privately only.</div>"
+            "</div>"
+        )
+    rooms = pairing.get("rooms", [])
+    state_rows = "\n".join(
+        f"<tr><td><code>{html.escape(str(room.get('room_id', '')))}</code></td>"
+        f"<td>{html.escape(str(room.get('pairing_role', '')))}</td>"
+        f"<td><code>{html.escape(str(room.get('pairing_state', '')))}</code></td>"
+        f"<td>{html.escape(str(room.get('safety_phrase') or 'not ready'))}</td></tr>"
+        for room in rooms
+    ) or "<tr><td colspan=\"4\" class=\"empty\">No pairing rooms yet.</td></tr>"
+    return f"""
+      <div class="pair-grid">
+        <form method="post" action="/api/pair/host?redirect=1&csrf={csrf}">
+          <strong>Host</strong>
+          <input name="relay" value="http://127.0.0.1:8778" aria-label="Relay URL">
+          <input name="ttl_seconds" value="600" aria-label="Invite expiry seconds">
+          <button>Create Invite</button>
+        </form>
+        <form method="post" action="/api/pair/join?redirect=1&csrf={csrf}">
+          <strong>Join</strong>
+          <input name="code" placeholder="GC1:..." aria-label="Invite code">
+          <button>Join Invite</button>
+        </form>
+        {invite_html}
+      </div>
+      <table><thead><tr><th>Room</th><th>Role</th><th>State</th><th>Safety Phrase</th></tr></thead><tbody>{state_rows}</tbody></table>
+      <div class="actions"><a href="/api/pair/status">Pair Status</a><a href="/api/trial/checklist?role=host">Host Checklist</a><a href="/api/trial/checklist?role=guest">Guest Checklist</a></div>
+    """
 
 
 def _trial_rows(trial: dict[str, Any]) -> str:
@@ -282,6 +365,7 @@ def _room_row(room: dict[str, Any], csrf: str) -> str:
     actions = " ".join(
         [
             f"<form method=\"post\" action=\"/api/rooms/sync?room_id={room_id_q}&redirect=1&csrf={csrf}\"><button>Sync</button></form>",
+            f"<form method=\"post\" action=\"/api/pair/verify?room_id={room_id_q}&redirect=1&csrf={csrf}\"><input name=\"phrase\" placeholder=\"Safety phrase\"><button>Verify</button></form>",
             f"<form method=\"post\" action=\"/api/rooms/request?room_id={room_id_q}&runbook=presence.ping&redirect=1&csrf={csrf}\"><button>Ping</button></form>",
             f"<form method=\"post\" action=\"/api/rooms/request?room_id={room_id_q}&runbook=gremlinchat.doctor&redirect=1&csrf={csrf}\"><button>Doctor</button></form>",
             f"<form method=\"post\" action=\"/api/rooms/disable?room_id={room_id_q}&redirect=1&csrf={csrf}\"><button>Disable</button></form>",
@@ -328,6 +412,28 @@ def _csrf_valid(home: Path, parsed: Any) -> bool:
     supplied = parse_qs(parsed.query).get("csrf", [""])[0]
     expected = load_or_create_dashboard_token(home)
     return bool(supplied) and secrets.compare_digest(supplied, expected)
+
+
+def _request_values(handler: BaseHTTPRequestHandler, parsed: Any) -> dict[str, list[str]]:
+    values = {key: list(value) for key, value in parse_qs(parsed.query).items()}
+    content_length = int(handler.headers.get("Content-Length", "0") or "0")
+    if content_length <= 0:
+        return values
+    raw = handler.rfile.read(content_length)
+    if not raw:
+        return values
+    content_type = handler.headers.get("Content-Type", "")
+    if "application/json" in content_type:
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except json.JSONDecodeError:
+            payload = {}
+        for key, value in payload.items():
+            values.setdefault(str(key), []).append(str(value))
+        return values
+    for key, value in parse_qs(raw.decode("utf-8")).items():
+        values.setdefault(key, []).extend(value)
+    return values
 
 
 def _action_response(handler: BaseHTTPRequestHandler, parsed: Any, payload: dict[str, Any]) -> None:

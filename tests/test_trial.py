@@ -139,7 +139,7 @@ def test_trial_checklist_tracks_role_and_room_states(tmp_path):
     peer = NodeIdentity.generate()
     save_room(_trial_room(peer=peer, verified=False), tmp_path)
     guest_joined = build_trial_checklist(tmp_path, role="guest")
-    assert any(command.startswith("gremlinchat room verify --phrase") for command in guest_joined["commands"])
+    assert any(command.startswith("gremlinchat pair verify --phrase") for command in guest_joined["commands"])
 
     room = load_rooms(tmp_path)[0]
     room["verified"] = True

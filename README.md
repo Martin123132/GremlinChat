@@ -31,25 +31,26 @@ Run a local relay:
 gremlinchat relay serve --host 127.0.0.1 --port 8778 --state-dir "$env:LOCALAPPDATA\GremlinChat\relay"
 ```
 
-Create a room:
+Create a first-run pairing invite. The host command immediately posts the host's signed pairing hello to the relay, so the room can lock to the host plus one guest:
 
 ```powershell
-gremlinchat room create --relay http://RELAY_HOST:8778
+gremlinchat pair host --relay http://RELAY_HOST:8778
 ```
 
 Join from the other machine:
 
 ```powershell
-gremlinchat room join GC1:...
-gremlinchat room verify --phrase WORD-WORD-WORD-WORD
-gremlinchat room loop
+gremlinchat pair join GC1:...
+gremlinchat pair status
+gremlinchat pair verify --phrase WORD-WORD-WORD-WORD
+gremlinchat trial listen
 ```
 
 Request a safe proof:
 
 ```powershell
 gremlinchat room sync
-gremlinchat room verify --phrase WORD-WORD-WORD-WORD
+gremlinchat pair verify --phrase WORD-WORD-WORD-WORD
 gremlinchat room request --runbook presence.ping
 gremlinchat room sync
 ```
@@ -97,7 +98,13 @@ The lower-level `trial host` and `trial guest` commands are still available for 
 Both sides compare the safety phrase by phone or another trusted channel, then each runs:
 
 ```powershell
-gremlinchat room verify --phrase WORD-WORD-WORD-WORD
+gremlinchat pair verify --phrase WORD-WORD-WORD-WORD
+```
+
+At any point, either side can inspect the consent state without exposing the invite code:
+
+```powershell
+gremlinchat pair status
 ```
 
 Guest keeps their machine listening for read-only proof requests:
@@ -172,6 +179,8 @@ http://127.0.0.1:8777/dashboard
 
 Dashboard buttons use a local CSRF token, so state-changing dashboard requests must come from the dashboard page itself.
 
+The dashboard includes a Pairing Ceremony section for creating a private invite, joining an invite, syncing, entering the verified safety phrase, revoking, and triggering emergency stop. The normal `/api/pair/status` endpoint does not return the invite code; the dashboard page can show the latest unexpired local invite because it is rendered with the local CSRF-protected dashboard session.
+
 ## Runbooks
 
 Read-only runbooks can run automatically:
@@ -202,7 +211,7 @@ Disable one room without deleting it:
 gremlinchat room disable
 ```
 
-Rooms cannot send or process encrypted runbook requests until the local owner runs `room verify` with the exact safety phrase shown by both machines.
+Rooms cannot send or process encrypted runbook requests until the local owner runs `pair verify` or `room verify` with the exact safety phrase shown by both machines.
 
 Pending approvals:
 
@@ -229,6 +238,8 @@ Imported partner receipts are written under:
 ```text
 %LOCALAPPDATA%\GremlinChat\partner-receipts\
 ```
+
+The latest locally generated invite is stored temporarily under local GremlinChat state using local secret protection so the dashboard can display it until it expires. Invite codes, relay tokens, local reports, and partner receipts must still stay out of git.
 
 ## Windows Install Script
 
