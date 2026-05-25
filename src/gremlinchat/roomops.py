@@ -8,6 +8,7 @@ from typing import Any
 
 from .crypto import EncryptedEnvelope, ReplayGuard, derive_room_key, open_message, safety_phrase, seal_message
 from .messages import create_task_request, create_task_result, verify_pair_hello
+from .receipts import create_receipt
 from .relay import RelayClient
 from .runbooks import ALL_RUNBOOKS, WRITE_RUNBOOKS, check_runbook_approval, execute_runbook
 from .store import (
@@ -73,6 +74,23 @@ def sync_room_messages(home: Path, room_id: str | None) -> dict[str, Any]:
             message = open_message(envelope=EncryptedEnvelope.from_dict(envelope), room_key=room_key(room, identity, x25519_identity), replay_guard=ReplayGuard())
             if message.get("type") == "task.result.v1":
                 message["report_paths"] = write_task_report(home, message)
+                result = dict(message.get("result", {}))
+                create_receipt(
+                    home,
+                    event_type="task.result",
+                    status=str(result.get("status", "received")),
+                    room_id=room["room_id"],
+                    task_id=str(message.get("task_id", "")),
+                    runbook=str(message.get("runbook", "")),
+                    dedupe_key=f"incoming:{message.get('task_id')}",
+                    evidence={
+                        "direction": "incoming",
+                        "peer_node_id": envelope.get("sender_node_id"),
+                        "accepted": bool(result.get("accepted", False)),
+                        "summary": result.get("summary", ""),
+                        "report_paths": message["report_paths"],
+                    },
+                )
             decrypted.append(message)
         except ValueError as exc:
             decrypted.append({"type": "message.error", "error": str(exc)})
@@ -96,6 +114,14 @@ def verify_room(home: Path, room_id: str | None, phrase: str) -> dict[str, Any]:
     room["verified_at"] = round(time.time(), 3)
     save_room(room, home)
     append_audit_event(home, {"event_type": "room.verified", "room_id": room["room_id"], "peer_node_id": room.get("peer_node_id")})
+    create_receipt(
+        home,
+        event_type="room.verified",
+        status="verified",
+        room_id=room["room_id"],
+        dedupe_key=f"room.verified:{room['room_id']}:{room.get('peer_node_id')}:{room['verified_at']}",
+        evidence={"room_id": room["room_id"], "peer_node_id": room.get("peer_node_id"), "verified_at": room["verified_at"]},
+    )
     return {"verified": True, "room_id": room["room_id"], "safety_phrase": expected}
 
 
@@ -106,6 +132,14 @@ def disable_room(home: Path, room_id: str | None) -> dict[str, Any]:
     room["disabled_at"] = round(time.time(), 3)
     save_room(room, home)
     append_audit_event(home, {"event_type": "room.disabled", "room_id": room["room_id"], "peer_node_id": room.get("peer_node_id")})
+    create_receipt(
+        home,
+        event_type="room.disabled",
+        status="disabled",
+        room_id=room["room_id"],
+        dedupe_key=f"room.disabled:{room['room_id']}:{room['disabled_at']}",
+        evidence={"room_id": room["room_id"], "peer_node_id": room.get("peer_node_id"), "disabled_at": room["disabled_at"]},
+    )
     return {"disabled": True, "room_id": room["room_id"]}
 
 
@@ -121,6 +155,14 @@ def revoke_room(home: Path, room_id: str | None) -> dict[str, Any]:
         policy.revoked_node_ids.append(peer_node_id)
         save_policy(policy, home)
     append_audit_event(home, {"event_type": "room.revoked", "room_id": room["room_id"], "peer_node_id": peer_node_id or None})
+    create_receipt(
+        home,
+        event_type="room.revoked",
+        status="revoked",
+        room_id=room["room_id"],
+        dedupe_key=f"room.revoked:{room['room_id']}:{room['revoked_at']}",
+        evidence={"room_id": room["room_id"], "peer_node_id": peer_node_id or None, "revoked_at": room["revoked_at"]},
+    )
     return {"revoked": True, "room_id": room["room_id"], "peer_node_id": peer_node_id or None}
 
 
@@ -142,6 +184,16 @@ def request_runbook(home: Path, room_id: str | None, runbook: str, payload: dict
     envelope = seal_message(room_id=room["room_id"], sender=identity, room_key=room_key(room, identity, x25519_identity), message=request)
     response = RelayClient(room["relay_url"]).post_envelope(room_id=room["room_id"], relay_token=room["relay_token"], envelope=envelope.to_dict())
     append_audit_event(home, {"event_type": "task.requested", "room_id": room["room_id"], "task_id": request["task_id"], "runbook": runbook, "relay_response": response})
+    create_receipt(
+        home,
+        event_type="task.requested",
+        status="accepted" if response.get("accepted") else "relay_rejected",
+        room_id=room["room_id"],
+        task_id=request["task_id"],
+        runbook=runbook,
+        dedupe_key=f"task.requested:{request['task_id']}",
+        evidence={"peer_node_id": room.get("peer_node_id"), "relay_response": response},
+    )
     return {"task_id": request["task_id"], "relay_response": response}
 
 
@@ -185,6 +237,23 @@ def process_room_once(home: Path, room_id: str | None) -> dict[str, Any]:
         if existing_approval:
             mark_approval_consumed(home, str(existing_approval["approval_id"]))
         report_paths = write_task_report(home, {"direction": "outgoing", "task_id": message["task_id"], "runbook": runbook, "result": result_dict, "relay_response": relay_response})
+        create_receipt(
+            home,
+            event_type="task.result",
+            status=str(result_dict.get("status", "returned")),
+            room_id=room["room_id"],
+            task_id=str(message["task_id"]),
+            runbook=runbook,
+            dedupe_key=f"outgoing:{message['task_id']}",
+            evidence={
+                "direction": "outgoing",
+                "requester_node_id": requester_node_id,
+                "accepted": bool(result_dict.get("accepted", False)),
+                "summary": result_dict.get("summary", ""),
+                "relay_response": relay_response,
+                "report_paths": report_paths,
+            },
+        )
         processed.add(str(message_id))
         replies.append({"task_id": message["task_id"], "runbook": runbook, "relay_response": relay_response, "report_paths": report_paths})
     room["processed_message_ids"] = sorted(processed)

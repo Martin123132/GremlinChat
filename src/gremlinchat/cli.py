@@ -15,6 +15,14 @@ from .crypto import (
 from .daemon import create_daemon_http_server
 from .install import run_install_doctor, write_install_doctor_report
 from .messages import create_pair_hello
+from .receipts import (
+    create_receipt,
+    find_receipt,
+    list_receipts,
+    receipt_summary,
+    verify_receipt_file,
+    write_receipt_bundle,
+)
 from .relay import RelayClient, create_relay_http_server
 from .roomops import (
     GremlinChatError,
@@ -288,7 +296,13 @@ def emergency_stop(args: argparse.Namespace) -> None:
     policy = load_policy(home)
     policy.emergency_stop = True
     save_policy(policy, home)
-    print(json.dumps({"emergency_stop": True, "home": str(home)}, indent=2, sort_keys=True))
+    receipt = create_receipt(
+        home,
+        event_type="emergency-stop",
+        status="active",
+        evidence={"emergency_stop": True, "trigger": "cli", "event_at": round(time.time(), 3)},
+    )
+    print(json.dumps({"emergency_stop": True, "home": str(home), "receipt": receipt_summary(receipt)}, indent=2, sort_keys=True))
 
 
 def install_doctor_command(args: argparse.Namespace) -> None:
@@ -299,6 +313,32 @@ def install_doctor_command(args: argparse.Namespace) -> None:
     print(json.dumps(report, indent=2, sort_keys=True))
     if not report["ok"]:
         raise SystemExit(1)
+
+
+def receipt_list_command(args: argparse.Namespace) -> None:
+    receipts = list_receipts(_home(args.home), limit=args.limit)
+    print(json.dumps({"schema": "gremlinchat.receipt-list.v1", "receipts": [receipt_summary(item) for item in receipts]}, indent=2, sort_keys=True))
+
+
+def receipt_show_command(args: argparse.Namespace) -> None:
+    try:
+        print(json.dumps(find_receipt(_home(args.home), args.receipt), indent=2, sort_keys=True))
+    except (FileNotFoundError, OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def receipt_verify_command(args: argparse.Namespace) -> None:
+    try:
+        verification = verify_receipt_file(args.path)
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+    print(json.dumps(verification, indent=2, sort_keys=True))
+    if not verification["ok"]:
+        raise SystemExit(1)
+
+
+def receipt_bundle_command(args: argparse.Namespace) -> None:
+    print(json.dumps({"bundle_paths": write_receipt_bundle(_home(args.home), room_id=args.room_id)}, indent=2, sort_keys=True))
 
 
 def approve_repo(args: argparse.Namespace) -> None:
@@ -482,6 +522,21 @@ def build_parser() -> argparse.ArgumentParser:
     install_doctor = install_subcommands.add_parser("doctor", help="Check local installer/runtime readiness")
     install_doctor.add_argument("--write-report", action="store_true", help="Write a redacted install doctor report under the local reports folder")
     install_doctor.set_defaults(func=install_doctor_command)
+
+    receipt_parser = subcommands.add_parser("receipt", help="Trust Receipt commands")
+    receipt_subcommands = receipt_parser.add_subparsers(dest="receipt_command", required=True)
+    receipt_list = receipt_subcommands.add_parser("list", help="List signed Trust Receipts")
+    receipt_list.add_argument("--limit", default=25, type=int)
+    receipt_list.set_defaults(func=receipt_list_command)
+    receipt_show = receipt_subcommands.add_parser("show", help="Show one Trust Receipt by id or path")
+    receipt_show.add_argument("receipt")
+    receipt_show.set_defaults(func=receipt_show_command)
+    receipt_verify = receipt_subcommands.add_parser("verify", help="Verify one Trust Receipt JSON file")
+    receipt_verify.add_argument("path")
+    receipt_verify.set_defaults(func=receipt_verify_command)
+    receipt_bundle = receipt_subcommands.add_parser("bundle", help="Write a redacted Trust Receipt bundle")
+    receipt_bundle.add_argument("--room-id", default=None)
+    receipt_bundle.set_defaults(func=receipt_bundle_command)
 
     daemon_parser = subcommands.add_parser("daemon", help="Local dashboard commands")
     daemon_subcommands = daemon_parser.add_subparsers(dest="daemon_command", required=True)

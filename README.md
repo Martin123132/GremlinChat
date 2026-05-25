@@ -132,6 +132,17 @@ Write a redacted support bundle for debugging without pasting a huge terminal du
 gremlinchat trial bundle --relay http://YOUR_LAN_OR_TAILSCALE_IP:8778
 ```
 
+List signed Trust Receipts created by pairing, task requests/results, proof runs, revoke, and emergency stop:
+
+```powershell
+gremlinchat receipt list
+gremlinchat receipt show receipt_...
+gremlinchat receipt verify "$env:LOCALAPPDATA\GremlinChat\receipts\receipt_....json"
+gremlinchat receipt bundle
+```
+
+Trust Receipts prove that a local GremlinChat node signed a redacted event record and that the file has not been altered. They do not prove that the signing node is trusted; you still compare the pairing safety phrase out of band.
+
 Clear local trial rooms, approvals, and reports for a fresh attempt while preserving this machine's identity and revoked peers:
 
 ```powershell
@@ -202,6 +213,12 @@ Reports are written under:
 
 ```text
 %LOCALAPPDATA%\GremlinChat\reports\
+```
+
+Trust Receipts are written under:
+
+```text
+%LOCALAPPDATA%\GremlinChat\receipts\
 ```
 
 ## Windows Install Script

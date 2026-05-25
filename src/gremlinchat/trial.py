@@ -19,6 +19,7 @@ from urllib.request import urlopen
 from .crypto import create_invite_code, parse_invite_code, protect_secret, safety_phrase, unprotect_secret
 from .messages import create_pair_hello
 from .redaction import redact_value
+from .receipts import create_receipt
 from .relay import RelayClient, create_relay_http_server
 from .roomops import GremlinChatError, process_room_once, request_runbook, revoke_room, sync_room_messages, verify_room
 from .runbooks import READ_RUNBOOKS, runbook_catalog
@@ -277,6 +278,20 @@ def run_live_read_only_proof(
     if write_report:
         report["report_paths"] = write_trial_report(home, report)
     append_audit_event(home, {"event_type": "trial.live_readonly_proof", "ok": ok, "runbook_results": runbook_results})
+    create_receipt(
+        home,
+        event_type="trial.live_readonly_proof",
+        status="completed" if ok else "incomplete",
+        room_id=room_id,
+        dedupe_key=f"trial.live_readonly_proof:{started_at}",
+        evidence={
+            "ok": ok,
+            "summary": report["summary"],
+            "started_at": started_at,
+            "completed_at": report["completed_at"],
+            "runbook_results": runbook_results,
+        },
+    )
     return report
 
 
