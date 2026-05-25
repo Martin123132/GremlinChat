@@ -8,11 +8,11 @@ import pytest
 
 from gremlinchat.cli import emergency_stop
 from gremlinchat.daemon import create_daemon_http_server
-from gremlinchat.receipts import create_receipt, list_receipts, verify_receipt, verify_receipt_file, write_receipt_bundle
+from gremlinchat.receipts import compare_receipts, create_receipt, import_partner_receipts, list_partner_receipts, list_receipts, verify_receipt, verify_receipt_bundle_file, verify_receipt_file, write_receipt_bundle
 from gremlinchat.relay import create_relay_http_server
 from gremlinchat.roomops import process_room_once, request_runbook, revoke_room, sync_room_messages, verify_room
 from gremlinchat.store import load_or_create_dashboard_token
-from gremlinchat.trial import accept_trial_invite, create_trial_invite, listen_once, run_live_read_only_proof
+from gremlinchat.trial import accept_trial_invite, create_trial_invite, listen_once, run_live_read_only_proof, write_trial_bundle
 
 
 def _post_json(url):
@@ -171,6 +171,7 @@ def test_dashboard_receipt_status_and_bundle_api(tmp_path):
     host, port = server.server_address
     try:
         status = _get_json(f"http://{host}:{port}/api/receipts/status")
+        compare = _get_json(f"http://{host}:{port}/api/receipts/compare")
         with pytest.raises(HTTPError) as exc_info:
             _post_json(f"http://{host}:{port}/api/receipts/bundle")
         bundle = _post_json(_csrf_url(tmp_path, f"http://{host}:{port}/api/receipts/bundle"))
@@ -181,6 +182,8 @@ def test_dashboard_receipt_status_and_bundle_api(tmp_path):
 
     assert status["schema"] == "gremlinchat.receipt-status.v1"
     assert status["count"] == 1
+    assert status["partner_count"] == 0
+    assert compare["schema"] == "gremlinchat.receipt-compare.v1"
     assert exc_info.value.code == 403
     assert bundle["ok"] is True
     assert "bundle_paths" in bundle
@@ -205,3 +208,95 @@ def test_receipt_bundle_is_verifiable_and_redacted(tmp_path):
     assert bundle["verification"][0]["ok"] is True
     assert "Bearer " not in raw
     assert str(tmp_path).replace("\\", "/") not in raw.replace("\\", "/")
+
+
+def test_partner_receipt_import_and_compare(tmp_path):
+    alice_home = tmp_path / "alice"
+    bob_home = tmp_path / "bob"
+    create_receipt(
+        alice_home,
+        event_type="task.requested",
+        status="accepted",
+        room_id="room_test",
+        task_id="task_test",
+        runbook="presence.ping",
+        evidence={"relay_response": {"accepted": True}},
+    )
+    create_receipt(
+        bob_home,
+        event_type="task.result",
+        status="completed",
+        room_id="room_test",
+        task_id="task_test",
+        runbook="presence.ping",
+        evidence={"accepted": True, "summary": "Presence ping completed."},
+    )
+    bundle_paths = write_receipt_bundle(bob_home, room_id="room_test")
+
+    verification = verify_receipt_bundle_file(bundle_paths["json"])
+    imported = import_partner_receipts(alice_home, bundle_paths["json"])
+    imported_again = import_partner_receipts(alice_home, bundle_paths["json"])
+    comparison = compare_receipts(alice_home, room_id="room_test")
+
+    assert verification["ok"] is True
+    assert imported["ok"] is True
+    assert imported["imported_count"] == 1
+    assert imported_again["imported_count"] == 0
+    assert imported_again["skipped_count"] == 1
+    assert len(list_partner_receipts(alice_home, limit=10)) == 1
+    assert comparison["ok"] is True
+    assert comparison["matched_count"] >= 1
+    assert comparison["missing_count"] == 0
+    assert comparison["mismatch_count"] == 0
+
+
+def test_partner_receipt_import_refuses_tampered_bundle(tmp_path):
+    bob_home = tmp_path / "bob"
+    alice_home = tmp_path / "alice"
+    create_receipt(
+        bob_home,
+        event_type="task.result",
+        status="completed",
+        room_id="room_test",
+        task_id="task_test",
+        runbook="presence.ping",
+        evidence={"accepted": True, "summary": "ok"},
+    )
+    bundle_paths = write_receipt_bundle(bob_home)
+    bundle = json.loads(open(bundle_paths["json"], encoding="utf-8").read())
+    bundle["receipts"][0]["evidence"]["summary"] = "changed"
+    tampered_path = tmp_path / "tampered-bundle.json"
+    tampered_path.write_text(json.dumps(bundle), encoding="utf-8")
+
+    verification = verify_receipt_bundle_file(tampered_path)
+    imported = import_partner_receipts(alice_home, tampered_path)
+
+    assert verification["ok"] is False
+    assert imported["ok"] is False
+    assert imported["imported_count"] == 0
+    assert list_partner_receipts(alice_home, limit=10) == []
+
+
+def test_receipt_bundle_verification_rejects_count_mismatch(tmp_path):
+    create_receipt(tmp_path, event_type="room.verified", status="verified", room_id="room_test", evidence={"ok": True})
+    paths = write_receipt_bundle(tmp_path)
+    bundle = json.loads(open(paths["json"], encoding="utf-8").read())
+    bundle["count"] = bundle["count"] + 1
+    changed_path = tmp_path / "count-mismatch.json"
+    changed_path.write_text(json.dumps(bundle), encoding="utf-8")
+
+    verification = verify_receipt_bundle_file(changed_path)
+
+    assert verification["ok"] is False
+    assert "receipt bundle count mismatch" in verification["errors"]
+
+
+def test_trial_bundle_includes_receipt_status(tmp_path):
+    create_receipt(tmp_path, event_type="room.verified", status="verified", room_id="room_test", evidence={"ok": True})
+
+    paths = write_trial_bundle(tmp_path)
+    bundle = json.loads(open(paths["json"], encoding="utf-8").read())
+
+    assert "receipts" in bundle
+    assert "receipt_compare" in bundle
+    assert bundle["receipts"]["count"] == 1

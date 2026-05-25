@@ -16,10 +16,14 @@ from .daemon import create_daemon_http_server
 from .install import run_install_doctor, write_install_doctor_report
 from .messages import create_pair_hello
 from .receipts import (
+    compare_receipts,
     create_receipt,
     find_receipt,
+    import_partner_receipts,
     list_receipts,
+    list_partner_receipts,
     receipt_summary,
+    verify_receipt_bundle_file,
     verify_receipt_file,
     write_receipt_bundle,
 )
@@ -316,8 +320,9 @@ def install_doctor_command(args: argparse.Namespace) -> None:
 
 
 def receipt_list_command(args: argparse.Namespace) -> None:
-    receipts = list_receipts(_home(args.home), limit=args.limit)
-    print(json.dumps({"schema": "gremlinchat.receipt-list.v1", "receipts": [receipt_summary(item) for item in receipts]}, indent=2, sort_keys=True))
+    home = _home(args.home)
+    receipts = list_partner_receipts(home, limit=args.limit) if args.partner else list_receipts(home, limit=args.limit)
+    print(json.dumps({"schema": "gremlinchat.receipt-list.v1", "source": "partner" if args.partner else "local", "receipts": [receipt_summary(item) for item in receipts]}, indent=2, sort_keys=True))
 
 
 def receipt_show_command(args: argparse.Namespace) -> None:
@@ -334,6 +339,33 @@ def receipt_verify_command(args: argparse.Namespace) -> None:
         raise SystemExit(str(exc)) from exc
     print(json.dumps(verification, indent=2, sort_keys=True))
     if not verification["ok"]:
+        raise SystemExit(1)
+
+
+def receipt_verify_bundle_command(args: argparse.Namespace) -> None:
+    try:
+        verification = verify_receipt_bundle_file(args.path)
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+    print(json.dumps(verification, indent=2, sort_keys=True))
+    if not verification["ok"]:
+        raise SystemExit(1)
+
+
+def receipt_import_command(args: argparse.Namespace) -> None:
+    try:
+        result = import_partner_receipts(_home(args.home), args.path)
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+    print(json.dumps(result, indent=2, sort_keys=True))
+    if not result["ok"]:
+        raise SystemExit(1)
+
+
+def receipt_compare_command(args: argparse.Namespace) -> None:
+    result = compare_receipts(_home(args.home), room_id=args.room_id)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    if not result["ok"] and args.strict:
         raise SystemExit(1)
 
 
@@ -527,6 +559,7 @@ def build_parser() -> argparse.ArgumentParser:
     receipt_subcommands = receipt_parser.add_subparsers(dest="receipt_command", required=True)
     receipt_list = receipt_subcommands.add_parser("list", help="List signed Trust Receipts")
     receipt_list.add_argument("--limit", default=25, type=int)
+    receipt_list.add_argument("--partner", action="store_true", help="List imported partner receipts instead of local receipts")
     receipt_list.set_defaults(func=receipt_list_command)
     receipt_show = receipt_subcommands.add_parser("show", help="Show one Trust Receipt by id or path")
     receipt_show.add_argument("receipt")
@@ -534,6 +567,16 @@ def build_parser() -> argparse.ArgumentParser:
     receipt_verify = receipt_subcommands.add_parser("verify", help="Verify one Trust Receipt JSON file")
     receipt_verify.add_argument("path")
     receipt_verify.set_defaults(func=receipt_verify_command)
+    receipt_verify_bundle = receipt_subcommands.add_parser("verify-bundle", help="Verify every Trust Receipt in a bundle")
+    receipt_verify_bundle.add_argument("path")
+    receipt_verify_bundle.set_defaults(func=receipt_verify_bundle_command)
+    receipt_import = receipt_subcommands.add_parser("import", help="Verify and import a partner receipt or receipt bundle")
+    receipt_import.add_argument("path")
+    receipt_import.set_defaults(func=receipt_import_command)
+    receipt_compare = receipt_subcommands.add_parser("compare", help="Compare local and imported partner receipt evidence")
+    receipt_compare.add_argument("--room-id", default=None)
+    receipt_compare.add_argument("--strict", action="store_true", help="Exit non-zero when evidence is missing or mismatched")
+    receipt_compare.set_defaults(func=receipt_compare_command)
     receipt_bundle = receipt_subcommands.add_parser("bundle", help="Write a redacted Trust Receipt bundle")
     receipt_bundle.add_argument("--room-id", default=None)
     receipt_bundle.set_defaults(func=receipt_bundle_command)

@@ -19,7 +19,7 @@ from urllib.request import urlopen
 from .crypto import create_invite_code, parse_invite_code, protect_secret, safety_phrase, unprotect_secret
 from .messages import create_pair_hello
 from .redaction import redact_value
-from .receipts import create_receipt
+from .receipts import compare_receipts, create_receipt, receipt_status
 from .relay import RelayClient, create_relay_http_server
 from .roomops import GremlinChatError, process_room_once, request_runbook, revoke_room, sync_room_messages, verify_room
 from .runbooks import READ_RUNBOOKS, runbook_catalog
@@ -423,6 +423,8 @@ def write_trial_bundle(home: Path, *, relay_url: str | None = None) -> dict[str,
             "approvals": load_approvals(home),
             "audit": read_audit_events(home, limit=50),
             "reports": _reports_index(home),
+            "receipts": receipt_status(home, limit=25),
+            "receipt_compare": compare_receipts(home),
             "versions": _version_summary(),
             "relay_health": None if relay_url is None else _relay_health_payload(relay_url),
         },
@@ -917,6 +919,8 @@ def _bundle_markdown(bundle: dict[str, Any]) -> str:
             f"- Rooms: `{len(bundle.get('rooms', []))}`",
             f"- Emergency Stop: `{bundle.get('policy', {}).get('emergency_stop')}`",
             f"- Read-Only Lock: `{bundle.get('policy', {}).get('trial_read_only_lock')}`",
+            f"- Local Receipts: `{bundle.get('receipts', {}).get('count', 0)}`",
+            f"- Partner Receipts: `{bundle.get('receipts', {}).get('partner_count', 0)}`",
             "",
             "## Preflight",
             "",

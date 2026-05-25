@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
 
-from .receipts import create_receipt, receipt_status, write_receipt_bundle
+from .receipts import compare_receipts, create_receipt, receipt_status, write_receipt_bundle
 from .roomops import GremlinChatError, disable_room, process_room_once, request_runbook, revoke_room, sync_room_messages
 from .runbooks import runbook_catalog
 from .store import decide_approval, load_approvals, load_or_create_dashboard_token, load_or_create_identity, load_policy, load_rooms, read_audit_events, save_policy
@@ -53,6 +53,11 @@ def create_daemon_http_server(home: Path, host: str = "127.0.0.1", port: int = 8
             if parsed.path == "/api/receipts/status":
                 with lock:
                     _json_response(self, 200, receipt_status(home))
+                return
+            if parsed.path == "/api/receipts/compare":
+                query = parse_qs(parsed.query)
+                with lock:
+                    _json_response(self, 200, compare_receipts(home, room_id=query.get("room_id", [None])[0]))
                 return
             _json_response(self, 404, {"error": "not found"})
 
@@ -169,6 +174,7 @@ def _render_dashboard(snapshot: dict[str, Any]) -> str:
     trial = snapshot["trial"]
     trial_rows = _trial_rows(trial)
     receipt_rows = _receipt_rows(snapshot["receipts"])
+    receipt_compare_rows = _receipt_compare_rows(snapshot["receipts"].get("compare", {}))
     approval_rows = "\n".join(
         f"<tr><td><code>{html.escape(str(approval.get('approval_id', '')))}</code></td><td>{html.escape(str(approval.get('runbook', '')))}</td><td>{html.escape(str(approval.get('reason', '')))}</td><td><form method=\"post\" action=\"/api/approvals/approve?approval_id={quote(str(approval.get('approval_id', '')), safe='')}&redirect=1&csrf={csrf}\"><button>Approve</button></form><form method=\"post\" action=\"/api/approvals/reject?approval_id={quote(str(approval.get('approval_id', '')), safe='')}&redirect=1&csrf={csrf}\"><button>Reject</button></form></td></tr>"
         for approval in pending
@@ -220,7 +226,7 @@ def _render_dashboard(snapshot: dict[str, Any]) -> str:
       <div class="metric"><span>Write Runbooks</span><strong>{len(policy["enabled_write_runbooks"])}</strong></div>
     </div>
     <section><h2>Trial</h2><table><thead><tr><th>Check</th><th>Status</th><th>Detail</th></tr></thead><tbody>{trial_rows}</tbody></table><div class="actions"><a href="/api/trial/checklist?role=host">Checklist</a><form method="post" action="/api/trial/bundle?redirect=1&csrf={csrf}"><button>Bundle</button></form><form method="post" action="/api/emergency-stop?redirect=1&csrf={csrf}"><button>Emergency Stop</button></form></div></section>
-    <section><h2>Trust Receipts</h2><table><thead><tr><th>Receipt</th><th>Issuer</th><th>Event</th><th>Status</th><th>Hint</th></tr></thead><tbody>{receipt_rows}</tbody></table><div class="actions"><a href="/api/receipts/status">Status</a><form method="post" action="/api/receipts/bundle?redirect=1&csrf={csrf}"><button>Bundle</button></form></div></section>
+    <section><h2>Trust Receipts</h2><table><thead><tr><th>Receipt</th><th>Source</th><th>Issuer</th><th>Event</th><th>Status</th></tr></thead><tbody>{receipt_rows}</tbody></table><div class="actions"><a href="/api/receipts/status">Status</a><a href="/api/receipts/compare">Compare</a><form method="post" action="/api/receipts/bundle?redirect=1&csrf={csrf}"><button>Bundle</button></form></div><table><thead><tr><th>Comparison</th><th>Count</th><th>Meaning</th></tr></thead><tbody>{receipt_compare_rows}</tbody></table></section>
     <section><h2>Rooms</h2><table><thead><tr><th>Room</th><th>Relay</th><th>Partner</th><th>State</th><th>Safety Phrase</th><th>Actions</th></tr></thead><tbody>{room_rows}</tbody></table></section>
     <section><h2>Pending Approvals</h2><table><thead><tr><th>Approval</th><th>Runbook</th><th>Reason</th><th>Decision</th></tr></thead><tbody>{approval_rows}</tbody></table></section>
     <section><h2>Audit</h2><table><thead><tr><th>Time</th><th>Event</th><th>Runbook</th><th>Summary</th></tr></thead><tbody>{audit_rows}</tbody></table></section>
@@ -245,16 +251,28 @@ def _trial_rows(trial: dict[str, Any]) -> str:
 
 
 def _receipt_rows(receipts: dict[str, Any]) -> str:
-    rows = receipts.get("latest", [])
+    rows = [("local", item) for item in receipts.get("latest", [])] + [("partner", item) for item in receipts.get("partner_latest", [])]
     if not rows:
         return "<tr><td colspan=\"5\" class=\"empty\">No Trust Receipts yet.</td></tr>"
     return "\n".join(
         f"<tr><td><code>{html.escape(str(receipt.get('receipt_id', '')))}</code></td>"
+        f"<td>{html.escape(source)}</td>"
         f"<td><code>{html.escape(str(receipt.get('issuer_node_id', '')))}</code></td>"
         f"<td>{html.escape(str(receipt.get('event_type', '')))}</td>"
-        f"<td><code>{html.escape(str(receipt.get('status', '')))}</code></td>"
-        f"<td>{html.escape(str(receipt.get('verification_hint', '')))}</td></tr>"
-        for receipt in rows
+        f"<td><code>{html.escape(str(receipt.get('status', '')))}</code></td></tr>"
+        for source, receipt in rows
+    )
+
+
+def _receipt_compare_rows(compare: dict[str, Any]) -> str:
+    rows = [
+        ("Matched", compare.get("matched_count", 0), "Local and imported partner evidence line up."),
+        ("Missing", compare.get("missing_count", 0), "Expected partner/local evidence has not been imported yet."),
+        ("Mismatches", compare.get("mismatch_count", 0), "Imported evidence disagrees with local evidence."),
+    ]
+    return "\n".join(
+        f"<tr><td>{html.escape(name)}</td><td><code>{html.escape(str(count))}</code></td><td>{html.escape(meaning)}</td></tr>"
+        for name, count, meaning in rows
     )
 
 

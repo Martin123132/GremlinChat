@@ -81,18 +81,31 @@ def find_receipt(home: Path, receipt_id_or_path: str) -> dict[str, Any]:
     if candidate.exists():
         return load_receipt(candidate)
     receipt_id = receipt_id_or_path[:-5] if receipt_id_or_path.endswith(".json") else receipt_id_or_path
-    path = ensure_home(home) / "receipts" / f"{receipt_id}.json"
-    if not path.exists():
-        raise FileNotFoundError(f"Unknown GremlinChat receipt: {receipt_id_or_path}")
-    return load_receipt(path)
+    home = ensure_home(home)
+    for path in [home / "receipts" / f"{receipt_id}.json", *list((home / "partner-receipts").glob(f"*/{receipt_id}.json"))]:
+        if path.exists():
+            return load_receipt(path)
+    raise FileNotFoundError(f"Unknown GremlinChat receipt: {receipt_id_or_path}")
 
 
 def list_receipts(home: Path, *, limit: int = 25, room_id: str | None = None) -> list[dict[str, Any]]:
-    receipts_dir = ensure_home(home) / "receipts"
-    if not receipts_dir.exists():
+    rows = _list_receipts_from_dir(ensure_home(home) / "receipts", room_id=room_id)
+    rows.sort(key=lambda item: float(item.get("created_at", 0)), reverse=True)
+    return rows[:limit]
+
+
+def list_partner_receipts(home: Path, *, limit: int = 25, room_id: str | None = None) -> list[dict[str, Any]]:
+    rows = _list_receipts_from_dir(ensure_home(home) / "partner-receipts", room_id=room_id, recursive=True)
+    rows.sort(key=lambda item: float(item.get("created_at", 0)), reverse=True)
+    return rows[:limit]
+
+
+def _list_receipts_from_dir(root: Path, *, room_id: str | None, recursive: bool = False) -> list[dict[str, Any]]:
+    if not root.exists():
         return []
     rows = []
-    for path in receipts_dir.glob("receipt_*.json"):
+    pattern = "**/receipt_*.json" if recursive else "receipt_*.json"
+    for path in root.glob(pattern):
         try:
             receipt = load_receipt(path)
         except (OSError, json.JSONDecodeError):
@@ -100,16 +113,25 @@ def list_receipts(home: Path, *, limit: int = 25, room_id: str | None = None) ->
         if room_id and receipt.get("room_id") != room_id:
             continue
         rows.append(receipt)
-    rows.sort(key=lambda item: float(item.get("created_at", 0)), reverse=True)
-    return rows[:limit]
+    return rows
 
 
 def receipt_status(home: Path, *, limit: int = 10) -> dict[str, Any]:
-    rows = list_receipts(home, limit=limit)
+    local_rows = list_receipts(home, limit=limit)
+    partner_rows = list_partner_receipts(home, limit=limit)
+    compare = compare_receipts(home)
     return {
         "schema": "gremlinchat.receipt-status.v1",
         "count": _receipt_count(home),
-        "latest": [receipt_summary(item) for item in rows],
+        "partner_count": _partner_receipt_count(home),
+        "latest": [receipt_summary(item) for item in local_rows],
+        "partner_latest": [receipt_summary(item) for item in partner_rows],
+        "compare": {
+            "ok": compare["ok"],
+            "matched_count": compare["matched_count"],
+            "mismatch_count": compare["mismatch_count"],
+            "missing_count": compare["missing_count"],
+        },
     }
 
 
@@ -159,6 +181,128 @@ def verify_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
 
 def verify_receipt_file(path: str | Path) -> dict[str, Any]:
     return verify_receipt(load_receipt(path))
+
+
+def verify_receipt_bundle_file(path: str | Path) -> dict[str, Any]:
+    bundle = json.loads(Path(path).read_text(encoding="utf-8"))
+    receipts = _receipts_from_payload(bundle)
+    verifications = [verify_receipt(receipt) for receipt in receipts]
+    errors = []
+    if bundle.get("schema") not in {BUNDLE_SCHEMA, RECEIPT_SCHEMA}:
+        errors.append("unsupported receipt bundle schema")
+    if bundle.get("schema") == BUNDLE_SCHEMA and int(bundle.get("count", len(receipts))) != len(receipts):
+        errors.append("receipt bundle count mismatch")
+    return {
+        "schema": "gremlinchat.receipt-bundle-verification.v1",
+        "ok": not errors and all(item["ok"] for item in verifications),
+        "bundle_schema": bundle.get("schema"),
+        "receipt_count": len(receipts),
+        "errors": errors,
+        "verification": verifications,
+        "statement": "Valid bundle receipts prove only issuer signatures and file integrity; issuer trust is still a human decision.",
+    }
+
+
+def import_partner_receipts(home: Path, path: str | Path) -> dict[str, Any]:
+    home = ensure_home(home)
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    receipts = _receipts_from_payload(payload)
+    if not receipts:
+        raise ValueError("No GremlinChat receipts found to import.")
+    verifications = [verify_receipt(receipt) for receipt in receipts]
+    if not all(item["ok"] for item in verifications):
+        return {
+            "schema": "gremlinchat.receipt-import.v1",
+            "ok": False,
+            "imported_count": 0,
+            "skipped_count": 0,
+            "errors": ["one or more receipts failed verification"],
+            "verification": verifications,
+            "statement": "Import refused altered or unverifiable receipts.",
+        }
+
+    imported = []
+    skipped = []
+    for receipt in receipts:
+        issuer = str(receipt.get("issuer_node_id") or "unknown")
+        receipt_id = str(receipt.get("receipt_id"))
+        paths = _partner_receipt_paths(home, issuer, receipt_id)
+        if paths["json"].exists():
+            skipped.append(receipt_id)
+            continue
+        paths["dir"].mkdir(parents=True, exist_ok=True)
+        paths["json"].write_text(json.dumps(receipt, indent=2, sort_keys=True), encoding="utf-8")
+        paths["markdown"].write_text(receipt_markdown(receipt), encoding="utf-8")
+        imported.append(receipt_id)
+    return {
+        "schema": "gremlinchat.receipt-import.v1",
+        "ok": True,
+        "source": str(path),
+        "imported_count": len(imported),
+        "skipped_count": len(skipped),
+        "imported_receipt_ids": imported,
+        "skipped_receipt_ids": skipped,
+        "verification": verifications,
+        "statement": "Signatures are valid, but imported issuer nodes are not automatically trusted.",
+    }
+
+
+def compare_receipts(home: Path, *, room_id: str | None = None) -> dict[str, Any]:
+    home = ensure_home(home)
+    local = list_receipts(home, limit=10000, room_id=room_id)
+    partner = list_partner_receipts(home, limit=10000, room_id=room_id)
+    local_by_id = _receipts_by_task(local)
+    partner_by_id = _receipts_by_task(partner)
+    matched = []
+    mismatches = []
+    missing = []
+
+    for task_id, local_receipt in local_by_id.get("task.requested", {}).items():
+        partner_result = partner_by_id.get("task.result", {}).get(task_id)
+        if partner_result is None:
+            missing.append({"kind": "missing_partner_result", "task_id": task_id, "runbook": local_receipt.get("runbook")})
+        else:
+            matched.append({"kind": "partner_result_for_local_request", "task_id": task_id, "runbook": local_receipt.get("runbook"), "partner_receipt_id": partner_result.get("receipt_id")})
+
+    for task_id, partner_request in partner_by_id.get("task.requested", {}).items():
+        local_result = local_by_id.get("task.result", {}).get(task_id)
+        if local_result is None:
+            missing.append({"kind": "missing_local_result", "task_id": task_id, "runbook": partner_request.get("runbook")})
+        else:
+            matched.append({"kind": "local_result_for_partner_request", "task_id": task_id, "runbook": partner_request.get("runbook"), "local_receipt_id": local_result.get("receipt_id")})
+
+    for task_id, local_result in local_by_id.get("task.result", {}).items():
+        partner_result = partner_by_id.get("task.result", {}).get(task_id)
+        if partner_result is None:
+            continue
+        if _result_fingerprint(local_result) == _result_fingerprint(partner_result):
+            matched.append({"kind": "matching_task_result", "task_id": task_id, "runbook": local_result.get("runbook"), "local_receipt_id": local_result.get("receipt_id"), "partner_receipt_id": partner_result.get("receipt_id")})
+        else:
+            mismatches.append({"kind": "task_result_mismatch", "task_id": task_id, "local": receipt_summary(local_result), "partner": receipt_summary(partner_result)})
+
+    local_verified_rooms = {receipt.get("room_id") for receipt in local if receipt.get("event_type") == "room.verified"}
+    partner_verified_rooms = {receipt.get("room_id") for receipt in partner if receipt.get("event_type") == "room.verified"}
+    for verified_room_id in sorted(item for item in local_verified_rooms & partner_verified_rooms if item):
+        matched.append({"kind": "both_verified_room", "room_id": verified_room_id})
+    if room_id and room_id in local_verified_rooms and room_id not in partner_verified_rooms:
+        missing.append({"kind": "missing_partner_room_verification", "room_id": room_id})
+    if room_id and room_id in partner_verified_rooms and room_id not in local_verified_rooms:
+        missing.append({"kind": "missing_local_room_verification", "room_id": room_id})
+
+    return {
+        "schema": "gremlinchat.receipt-compare.v1",
+        "ok": not mismatches and not missing,
+        "room_id": room_id,
+        "local_count": len(local),
+        "partner_count": len(partner),
+        "matched_count": len(matched),
+        "mismatch_count": len(mismatches),
+        "missing_count": len(missing),
+        "matched": matched,
+        "mismatches": mismatches,
+        "missing": missing,
+        "statement": "Comparison highlights matching or missing signed receipt evidence; it does not make issuer trust decisions.",
+    }
 
 
 def write_receipt_bundle(home: Path, *, room_id: str | None = None) -> dict[str, str]:
@@ -274,6 +418,40 @@ def _receipt_paths(home: Path, receipt_id: str) -> dict[str, Path]:
     return {"dir": receipts_dir, "json": receipts_dir / f"{receipt_id}.json", "markdown": receipts_dir / f"{receipt_id}.md"}
 
 
+def _partner_receipt_paths(home: Path, issuer_node_id: str, receipt_id: str) -> dict[str, Path]:
+    receipts_dir = home / "partner-receipts" / issuer_node_id
+    return {"dir": receipts_dir, "json": receipts_dir / f"{receipt_id}.json", "markdown": receipts_dir / f"{receipt_id}.md"}
+
+
+def _receipts_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    if payload.get("schema") == RECEIPT_SCHEMA:
+        return [payload]
+    if payload.get("schema") == BUNDLE_SCHEMA:
+        return [dict(item) for item in payload.get("receipts", [])]
+    return []
+
+
+def _receipts_by_task(receipts: list[dict[str, Any]]) -> dict[str, dict[str, dict[str, Any]]]:
+    result: dict[str, dict[str, dict[str, Any]]] = {}
+    for receipt in receipts:
+        event_type = str(receipt.get("event_type") or "")
+        task_id = str(receipt.get("task_id") or "")
+        if not event_type or not task_id:
+            continue
+        result.setdefault(event_type, {})[task_id] = receipt
+    return result
+
+
+def _result_fingerprint(receipt: dict[str, Any]) -> dict[str, Any]:
+    evidence = dict(receipt.get("evidence") or {})
+    return {
+        "status": receipt.get("status"),
+        "runbook": receipt.get("runbook"),
+        "accepted": evidence.get("accepted"),
+        "summary": evidence.get("summary"),
+    }
+
+
 def _dedupe_payload(
     issuer_node_id: str,
     *,
@@ -303,6 +481,13 @@ def _receipt_count(home: Path) -> int:
     if not receipts_dir.exists():
         return 0
     return len([path for path in receipts_dir.glob("receipt_*.json") if path.is_file()])
+
+
+def _partner_receipt_count(home: Path) -> int:
+    receipts_dir = ensure_home(home) / "partner-receipts"
+    if not receipts_dir.exists():
+        return 0
+    return len([path for path in receipts_dir.glob("**/receipt_*.json") if path.is_file()])
 
 
 def _sha256_hex(payload: bytes) -> str:

@@ -138,6 +138,9 @@ List signed Trust Receipts created by pairing, task requests/results, proof runs
 gremlinchat receipt list
 gremlinchat receipt show receipt_...
 gremlinchat receipt verify "$env:LOCALAPPDATA\GremlinChat\receipts\receipt_....json"
+gremlinchat receipt verify-bundle "$env:LOCALAPPDATA\GremlinChat\reports\receipt-bundle-....json"
+gremlinchat receipt import "$env:USERPROFILE\Downloads\glyn-receipt-bundle.json"
+gremlinchat receipt compare --room-id room_...
 gremlinchat receipt bundle
 ```
 
@@ -219,6 +222,12 @@ Trust Receipts are written under:
 
 ```text
 %LOCALAPPDATA%\GremlinChat\receipts\
+```
+
+Imported partner receipts are written under:
+
+```text
+%LOCALAPPDATA%\GremlinChat\partner-receipts\
 ```
 
 ## Windows Install Script
