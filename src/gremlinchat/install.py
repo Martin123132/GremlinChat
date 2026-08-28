@@ -56,6 +56,7 @@ def run_install_doctor(home: Path) -> dict[str, Any]:
     _add_identity_check(add, home)
     _add_dashboard_token_check(add, home)
     _add_reports_writable_check(add, home)
+    _add_storage_posture_checks(add, home)
     _add_policy_check(add, home)
     _add_windows_install_checks(add)
 
@@ -120,7 +121,14 @@ def _add_package_check(add: Any) -> None:
 def _add_cli_check(add: Any) -> None:
     cli_path = shutil.which("gremlinchat")
     if cli_path:
-        add("cli", "pass", "gremlinchat command is available on PATH.", {"path": cli_path})
+        flags = _path_flags(Path(cli_path))
+        add(
+            "cli",
+            "warning" if flags else "pass",
+            "gremlinchat command is available on PATH." if not flags else "gremlinchat on PATH appears to resolve from C/OneDrive; use the D-drive installer or call the D venv command.",
+            {"path": cli_path, "flags": flags},
+            required=False,
+        )
     else:
         add("cli", "warning", "gremlinchat command is not on PATH; installer venv shortcut may still work.", required=False)
 
@@ -187,6 +195,40 @@ def _add_reports_writable_check(add: Any, home: Path) -> None:
         add("reports_writable", "fail", f"Reports directory is not writable: {exc}", {"path": str(reports_dir)})
 
 
+def _add_storage_posture_checks(add: Any, home: Path) -> None:
+    cwd = Path.cwd()
+    repo_flags = _path_flags(cwd)
+    repo_status = "warning" if repo_flags else "pass"
+    add(
+        "repo_storage_posture",
+        repo_status,
+        "Repository is on D-safe storage." if not repo_flags else "Repository appears to be on C/OneDrive; use a D-drive checkout for live trials.",
+        {"path": str(cwd), "flags": repo_flags},
+        required=False,
+    )
+
+    home_flags = _path_flags(home)
+    if _is_under_env(home, "LOCALAPPDATA"):
+        home_flags.append("under_localappdata")
+    add(
+        "home_storage_posture",
+        "warning" if home_flags else "pass",
+        "GremlinChat home is on D-safe storage." if not home_flags else "GremlinChat home/runtime state appears to be on C or LOCALAPPDATA; set GREMLINCHAT_HOME or pass --home D:\\GremlinChat\\state.",
+        {"home": str(home), "flags": sorted(set(home_flags)), "gremlinchat_home_env": os.environ.get("GREMLINCHAT_HOME")},
+        required=False,
+    )
+
+    artifact_paths = [home / "reports", home / "receipts", home / "partner-receipts"]
+    flagged = [str(path) for path in artifact_paths if _path_flags(path) or _is_under_env(path, "LOCALAPPDATA")]
+    add(
+        "artifact_storage_posture",
+        "warning" if flagged else "pass",
+        "Reports and Trust Receipts are configured for D-safe storage." if not flagged else "Reports, receipts, or partner receipts would land on C/LOCALAPPDATA.",
+        {"paths": [str(path) for path in artifact_paths], "flagged": flagged},
+        required=False,
+    )
+
+
 def _add_policy_check(add: Any, home: Path) -> None:
     policy = load_policy(home)
     add(
@@ -211,10 +253,11 @@ def _add_windows_install_checks(add: Any) -> None:
         return
     local_app_data = os.environ.get("LOCALAPPDATA")
     app_data = os.environ.get("APPDATA")
-    if not local_app_data or not app_data:
-        add("windows_installer", "warning", "LOCALAPPDATA or APPDATA is not set, so installer paths cannot be checked.", required=False)
+    install_root = os.environ.get("GREMLINCHAT_INSTALL_ROOT")
+    if not app_data or (not local_app_data and not install_root):
+        add("windows_installer", "warning", "LOCALAPPDATA/APPDATA or GREMLINCHAT_INSTALL_ROOT is not set, so installer paths cannot be checked.", required=False)
         return
-    gremlin_root = Path(local_app_data) / "GremlinChat"
+    gremlin_root = Path(install_root) if install_root else Path(str(local_app_data)) / "GremlinChat"
     gremlin_exe = gremlin_root / ".venv" / "Scripts" / "gremlinchat.exe"
     start_menu = Path(app_data) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "GremlinChat"
     expected_shortcuts = [
@@ -239,6 +282,29 @@ def _add_windows_install_checks(add: Any) -> None:
         {"start_menu": str(start_menu), "missing": missing_shortcuts},
         required=False,
     )
+
+
+def _path_flags(path: Path) -> list[str]:
+    flags: list[str] = []
+    text = str(path).replace("\\", "/").lower()
+    if "onedrive" in text:
+        flags.append("onedrive")
+    if path.drive.upper() == "C:":
+        flags.append("c_drive")
+    return flags
+
+
+def _is_under_env(path: Path, env_name: str) -> bool:
+    raw_root = os.environ.get(env_name)
+    if not raw_root:
+        return False
+    try:
+        Path(path).resolve().relative_to(Path(raw_root).resolve())
+        return True
+    except ValueError:
+        return False
+    except OSError:
+        return False
 
 
 def _doctor_markdown(report: dict[str, Any]) -> str:

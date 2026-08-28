@@ -14,8 +14,13 @@ from typing import Any
 from .crypto import NodeIdentity, X25519Identity, protect_secret, unprotect_secret
 from .redaction import redact_value
 
+GREMLINCHAT_HOME_ENV = "GREMLINCHAT_HOME"
+
 
 def default_home() -> Path:
+    configured = os.environ.get(GREMLINCHAT_HOME_ENV)
+    if configured:
+        return Path(configured).expanduser()
     root = os.environ.get("LOCALAPPDATA")
     if root:
         return Path(root) / "GremlinChat"

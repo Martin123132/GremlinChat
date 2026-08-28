@@ -23,7 +23,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from .jsonutil import canonical_bytes
 
 INVITE_PREFIX = "GC1:"
-DEFAULT_INVITE_TTL_SECONDS = 600
+DEFAULT_INVITE_TTL_SECONDS = 3600
 
 
 def b64encode(data: bytes) -> str:

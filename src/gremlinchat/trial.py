@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import socket
 import subprocess
@@ -16,12 +17,12 @@ from typing import Any, Callable
 from urllib.error import URLError
 from urllib.request import urlopen
 
-from .crypto import parse_invite_code, protect_secret, unprotect_secret
+from .crypto import DEFAULT_INVITE_TTL_SECONDS, parse_invite_code, protect_secret, unprotect_secret
 from .pairing import pair_host, pair_join
 from .redaction import redact_value
 from .receipts import compare_receipts, create_receipt, receipt_status
 from .relay import create_relay_http_server
-from .roomops import GremlinChatError, process_room_once, request_runbook, revoke_room, sync_room_messages, verify_room
+from .roomops import GremlinChatError, load_room, process_room_once, request_runbook, require_room_verified, revoke_room, sync_room_messages, verify_room
 from .runbooks import READ_RUNBOOKS, runbook_catalog
 from .store import (
     append_audit_event,
@@ -38,9 +39,11 @@ from .store import (
 
 TRIAL_RUNBOOKS = ["presence.ping", "machine.status", "gremlinchat.doctor"]
 RESET_CONFIRMATION = "RESET-GREMLINCHAT-TRIAL"
+DEFAULT_TRIAL_INVITE_TTL_SECONDS = DEFAULT_INVITE_TTL_SECONDS
+DEFAULT_LIVE_PROOF_TIMEOUT_SECONDS = 120.0
 
 
-def create_trial_invite(home: Path, *, relay_url: str, ttl_seconds: int = 600) -> dict[str, Any]:
+def create_trial_invite(home: Path, *, relay_url: str, ttl_seconds: int = DEFAULT_TRIAL_INVITE_TTL_SECONDS) -> dict[str, Any]:
     home = ensure_home(home)
     pairing = pair_host(home, relay_url=relay_url, ttl_seconds=ttl_seconds, read_only_lock=True)
     result = {
@@ -82,7 +85,7 @@ def accept_trial_invite(home: Path, code: str) -> dict[str, Any]:
     return result
 
 
-def run_host_session(home: Path, *, relay_url: str, ttl_seconds: int = 600) -> dict[str, Any]:
+def run_host_session(home: Path, *, relay_url: str, ttl_seconds: int = DEFAULT_TRIAL_INVITE_TTL_SECONDS) -> dict[str, Any]:
     home = ensure_home(home)
     lock = enforce_trial_read_only_lock(home)
     preflight = run_preflight(home, relay_url=relay_url)
@@ -165,15 +168,72 @@ def run_live_read_only_proof(
     home: Path,
     *,
     room_id: str | None = None,
-    timeout_seconds: float = 30.0,
+    timeout_seconds: float = DEFAULT_LIVE_PROOF_TIMEOUT_SECONDS,
     poll_interval: float = 2.0,
     write_report: bool = True,
     process_once: Callable[[], Any] | None = None,
+    fresh: bool = False,
 ) -> dict[str, Any]:
     home = ensure_home(home)
+    room = load_room(home, room_id)
+    require_room_verified(room)
+    policy = load_policy(home)
+    if policy.emergency_stop:
+        raise GremlinChatError("Emergency stop is active; live proof requests are disabled.")
+    if room.get("peer_node_id") in policy.revoked_node_ids:
+        raise GremlinChatError("This room's peer has been revoked.")
+    resolved_room_id = str(room["room_id"])
+    if not fresh:
+        resumable = _latest_incomplete_live_proof(home, room_id=resolved_room_id)
+        if resumable is not None:
+            return _collect_live_read_only_proof(
+                home,
+                room_id=resolved_room_id,
+                sent=_sent_tasks_from_report(resumable["report"]),
+                previous_report=resumable["report"],
+                started_at=float(resumable["report"].get("started_at") or time.time()),
+                timeout_seconds=timeout_seconds,
+                poll_interval=poll_interval,
+                write_report=write_report,
+                process_once=process_once,
+                resumed_from=resumable,
+            )
+
     started_at = round(time.time(), 3)
-    sent = [request_runbook(home, room_id, runbook, {}) for runbook in TRIAL_RUNBOOKS]
-    expected = {item["task_id"]: runbook for item, runbook in zip(sent, TRIAL_RUNBOOKS, strict=True)}
+    sent = []
+    for runbook in TRIAL_RUNBOOKS:
+        request = request_runbook(home, resolved_room_id, runbook, {})
+        request["runbook"] = runbook
+        sent.append(request)
+    return _collect_live_read_only_proof(
+        home,
+        room_id=resolved_room_id,
+        sent=sent,
+        previous_report=None,
+        started_at=started_at,
+        timeout_seconds=timeout_seconds,
+        poll_interval=poll_interval,
+        write_report=write_report,
+        process_once=process_once,
+        resumed_from=None,
+    )
+
+
+def _collect_live_read_only_proof(
+    home: Path,
+    *,
+    room_id: str,
+    sent: list[dict[str, Any]],
+    previous_report: dict[str, Any] | None,
+    started_at: float,
+    timeout_seconds: float,
+    poll_interval: float,
+    write_report: bool,
+    process_once: Callable[[], Any] | None,
+    resumed_from: dict[str, Any] | None,
+) -> dict[str, Any]:
+    expected_pairs = _expected_runbooks(sent, previous_report=previous_report)
+    expected = {task_id: runbook for task_id, runbook in expected_pairs}
     results: dict[str, dict[str, Any]] = {}
     deadline = time.monotonic() + timeout_seconds
     syncs = []
@@ -193,7 +253,7 @@ def run_live_read_only_proof(
         if poll_interval > 0:
             time.sleep(poll_interval)
     runbook_results = []
-    for task_id, runbook in expected.items():
+    for task_id, runbook in expected_pairs:
         message = results.get(task_id)
         result = {} if message is None else dict(message.get("result", {}))
         runbook_results.append(
@@ -206,13 +266,26 @@ def run_live_read_only_proof(
             }
         )
     ok = len(results) == len(expected) and all(item["result_accepted"] for item in runbook_results)
+    resumed = resumed_from is not None
+    if ok and resumed:
+        summary = "Live read-only proof completed from previously sent tasks."
+    elif ok:
+        summary = "Live read-only proof completed."
+    elif resumed:
+        summary = "Live read-only proof still has missing late results."
+    else:
+        summary = "Live read-only proof did not receive every expected result."
     report = {
         "schema": "gremlinchat.live-readonly-proof.v1",
         "ok": ok,
-        "summary": "Live read-only proof completed." if ok else "Live read-only proof did not receive every expected result.",
+        "summary": summary,
+        "proof_status": "completed" if ok else "incomplete",
         "started_at": started_at,
         "completed_at": round(time.time(), 3),
+        "room_id": room_id,
         "timeout_seconds": timeout_seconds,
+        "resumed": resumed,
+        "resumed_from_report": None if resumed_from is None else Path(str(resumed_from["path"])).name,
         "read_only_runbooks": TRIAL_RUNBOOKS,
         "sent_tasks": sent,
         "runbook_results": runbook_results,
@@ -236,6 +309,77 @@ def run_live_read_only_proof(
         },
     )
     return report
+
+
+def _latest_incomplete_live_proof(home: Path, *, room_id: str) -> dict[str, Any] | None:
+    reports_dir = home / "reports"
+    if not reports_dir.exists():
+        return None
+    candidates = sorted(reports_dir.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True)
+    completed_fingerprints: set[tuple[str, tuple[str, ...]]] = set()
+    completed_sources: set[str] = set()
+    for path in candidates:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if data.get("schema") != "gremlinchat.live-readonly-proof.v1" or data.get("ok") is not True:
+            continue
+        completed_fingerprints.add(_proof_fingerprint(data))
+        source = data.get("resumed_from_report")
+        if source:
+            completed_sources.add(str(source))
+    for path in candidates:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if data.get("schema") != "gremlinchat.live-readonly-proof.v1":
+            continue
+        if data.get("ok") is True:
+            continue
+        if not _sent_tasks_from_report(data):
+            continue
+        if path.name in completed_sources or _proof_fingerprint(data) in completed_fingerprints:
+            continue
+        report_room_id = data.get("room_id")
+        if report_room_id and str(report_room_id) != room_id:
+            continue
+        return {"path": str(path), "report": data, "legacy_room_id_missing": report_room_id is None}
+    return None
+
+
+def _sent_tasks_from_report(report: dict[str, Any]) -> list[dict[str, Any]]:
+    sent = []
+    for item in report.get("sent_tasks", []):
+        if isinstance(item, dict) and item.get("task_id"):
+            sent.append(dict(item))
+    return sent
+
+
+def _expected_runbooks(sent: list[dict[str, Any]], *, previous_report: dict[str, Any] | None) -> list[tuple[str, str]]:
+    previous_runbooks: dict[str, str] = {}
+    if previous_report:
+        for item in previous_report.get("runbook_results", []):
+            task_id = str(item.get("task_id") or "")
+            runbook = str(item.get("runbook") or "")
+            if task_id and runbook:
+                previous_runbooks[task_id] = runbook
+    expected = []
+    for index, item in enumerate(sent):
+        task_id = str(item.get("task_id") or "")
+        if not task_id:
+            continue
+        runbook = str(item.get("runbook") or previous_runbooks.get(task_id) or "")
+        if not runbook and index < len(TRIAL_RUNBOOKS):
+            runbook = TRIAL_RUNBOOKS[index]
+        expected.append((task_id, runbook or "unknown"))
+    return expected
+
+
+def _proof_fingerprint(report: dict[str, Any]) -> tuple[str, tuple[str, ...]]:
+    task_ids = tuple(str(item.get("task_id") or "") for item in _sent_tasks_from_report(report))
+    return (str(report.get("started_at") or ""), task_ids)
 
 
 def enforce_trial_read_only_lock(home: Path) -> dict[str, Any]:
@@ -286,12 +430,16 @@ def build_trial_checklist(home: Path, *, role: str, relay_url: str | None = None
                 commands.append("gremlinchat trial host-session --relay http://YOUR_LAN_OR_TAILSCALE_IP:8778")
                 next_steps.append("Start or choose the private relay, then create the host invite.")
         elif unverified_rooms:
-            commands.append("gremlinchat room sync")
+            room_id = str(unverified_rooms[0].get("room_id") or "")
+            room_suffix = f" --room-id {room_id}" if room_id else ""
+            commands.append(f"gremlinchat room sync{room_suffix}")
             phrase = str(unverified_rooms[0].get("safety_phrase") or "WORD-WORD-WORD-WORD")
-            commands.append(f"gremlinchat pair verify --phrase {phrase}")
+            commands.append(f"gremlinchat pair verify{room_suffix} --phrase {phrase}")
             next_steps.append("Compare the safety phrase out of band before running verify.")
         elif verified_rooms:
-            commands.append("gremlinchat trial prove")
+            room_id = str(verified_rooms[0].get("room_id") or "")
+            room_suffix = f" --room-id {room_id}" if room_id else ""
+            commands.append(f"gremlinchat trial prove{room_suffix}")
             commands.append("gremlinchat trial bundle")
             next_steps.append("Ask the guest to run gremlinchat trial listen, then run the proof.")
         else:
@@ -302,11 +450,15 @@ def build_trial_checklist(home: Path, *, role: str, relay_url: str | None = None
             commands.append("gremlinchat trial guest-session GC1:...")
             next_steps.append("Paste only an invite code received privately from the host.")
         elif unverified_rooms:
+            room_id = str(unverified_rooms[0].get("room_id") or "")
+            room_suffix = f" --room-id {room_id}" if room_id else ""
             phrase = str(unverified_rooms[0].get("safety_phrase") or "WORD-WORD-WORD-WORD")
-            commands.append(f"gremlinchat pair verify --phrase {phrase}")
+            commands.append(f"gremlinchat pair verify{room_suffix} --phrase {phrase}")
             next_steps.append("Compare this safety phrase with the host out of band before verifying.")
         elif verified_rooms:
-            commands.append("gremlinchat trial listen")
+            room_id = str(verified_rooms[0].get("room_id") or "")
+            room_suffix = f" --room-id {room_id}" if room_id else ""
+            commands.append(f"gremlinchat trial listen{room_suffix}")
             commands.append("gremlinchat trial bundle")
             next_steps.append("Keep the listener running while the host runs gremlinchat trial prove.")
         else:
@@ -472,10 +624,11 @@ def run_preflight(
         status = "warning" if policy.enabled_write_runbooks else "pass"
         add("read_only_trial_lock", status, "Write-capable runbooks are blocked by the trial read-only lock.", {"enabled_write_runbooks": policy.enabled_write_runbooks})
     else:
-        add("read_only_trial_lock", "fail", "Trial read-only lock is off; turn it back on before the Martin/Glyn trial.", {"enabled_write_runbooks": policy.enabled_write_runbooks})
+        add("read_only_trial_lock", "fail", "Trial read-only lock is off; turn it back on before the private read-only trial.", {"enabled_write_runbooks": policy.enabled_write_runbooks})
 
     redacted = json.dumps(redact_value({"relay_token": "secret-token", "line": "Bearer abcdefghijklmnopqrstuvwxyz123456"}), sort_keys=True)
     add("report_redaction", "pass" if "secret-token" not in redacted and "Bearer " not in redacted else "fail", "Report redaction removes relay tokens and bearer-style secrets.")
+    _add_trial_storage_posture(add, home)
 
     ok = not any(check["status"] == "fail" for check in checks)
     return {
@@ -516,7 +669,7 @@ def run_trial_simulation(*, write_report_home: Path | None = None) -> dict[str, 
 
 def write_trial_report(home: Path, summary: dict[str, Any]) -> dict[str, str]:
     home = ensure_home(home)
-    safe_summary = redact_value(summary)
+    safe_summary = _sanitize_bundle(home, summary)
     reports_dir = home / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -615,6 +768,59 @@ def _relay_check(relay_url: str) -> tuple[str, str, Any]:
         return ("pass", "Relay health endpoint is reachable.", payload)
     except (OSError, URLError, json.JSONDecodeError) as exc:
         return ("fail", f"Relay is not reachable: {exc}", None)
+
+
+def _add_trial_storage_posture(add: Any, home: Path) -> None:
+    cwd = Path.cwd()
+    repo_flags = _path_flags(cwd)
+    add(
+        "repo_storage_posture",
+        "warning" if repo_flags else "pass",
+        "Repository is on D-safe storage." if not repo_flags else "Repository appears to be on C/OneDrive; use a D-drive checkout for the private trial.",
+        {"path": str(cwd), "flags": repo_flags},
+    )
+
+    home_flags = _path_flags(home)
+    if _is_under_env(home, "LOCALAPPDATA"):
+        home_flags.append("under_localappdata")
+    add(
+        "home_storage_posture",
+        "warning" if home_flags else "pass",
+        "GremlinChat home/runtime state is on D-safe storage." if not home_flags else "GremlinChat home/runtime state appears to be on C or LOCALAPPDATA; set GREMLINCHAT_HOME or pass --home D:\\GremlinChat\\state.",
+        {"home": str(home), "flags": sorted(set(home_flags)), "gremlinchat_home_env": os.environ.get("GREMLINCHAT_HOME")},
+    )
+
+    artifact_paths = [home / "reports", home / "receipts", home / "partner-receipts"]
+    flagged = [str(path) for path in artifact_paths if _path_flags(path) or _is_under_env(path, "LOCALAPPDATA")]
+    add(
+        "trial_artifact_storage",
+        "warning" if flagged else "pass",
+        "Reports, receipts, and partner receipts are configured for D-safe storage." if not flagged else "Trial reports, receipts, or partner receipts would land on C/LOCALAPPDATA.",
+        {"paths": [str(path) for path in artifact_paths], "flagged": flagged},
+    )
+
+
+def _path_flags(path: Path) -> list[str]:
+    flags: list[str] = []
+    text = str(path).replace("\\", "/").lower()
+    if "onedrive" in text:
+        flags.append("onedrive")
+    if path.drive.upper() == "C:":
+        flags.append("c_drive")
+    return flags
+
+
+def _is_under_env(path: Path, env_name: str) -> bool:
+    raw_root = os.environ.get(env_name)
+    if not raw_root:
+        return False
+    try:
+        Path(path).resolve().relative_to(Path(raw_root).resolve())
+        return True
+    except ValueError:
+        return False
+    except OSError:
+        return False
 
 
 def _room_summary(room: dict[str, Any]) -> dict[str, Any]:

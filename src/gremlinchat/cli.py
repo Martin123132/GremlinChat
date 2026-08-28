@@ -50,6 +50,8 @@ from .store import (
     save_policy,
 )
 from .trial import (
+    DEFAULT_LIVE_PROOF_TIMEOUT_SECONDS,
+    DEFAULT_TRIAL_INVITE_TTL_SECONDS,
     RESET_CONFIRMATION,
     accept_trial_invite,
     build_trial_checklist,
@@ -387,6 +389,7 @@ def trial_prove_command(args: argparse.Namespace) -> None:
             timeout_seconds=args.timeout_seconds,
             poll_interval=args.interval,
             write_report=not args.no_report,
+            fresh=args.fresh,
         )
     except GremlinChatError as exc:
         raise SystemExit(str(exc)) from exc
@@ -484,7 +487,7 @@ def _owner_rejected_result(runbook: str) -> dict:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gremlinchat", description="GremlinChat private control room")
-    parser.add_argument("--home", default=None, help="Config directory. Defaults to LOCALAPPDATA/GremlinChat.")
+    parser.add_argument("--home", default=None, help="Config directory. Defaults to GREMLINCHAT_HOME, then LOCALAPPDATA/GremlinChat.")
     subcommands = parser.add_subparsers(dest="command", required=True)
     subcommands.add_parser("setup", help="Create local identity and default policy").set_defaults(func=setup)
     subcommands.add_parser("status", help="Show local status").set_defaults(func=show_status)
@@ -544,7 +547,7 @@ def build_parser() -> argparse.ArgumentParser:
     pair_subcommands = pair_parser.add_subparsers(dest="pair_command", required=True)
     pair_host_parser = pair_subcommands.add_parser("host", help="Create a private invite and register this host with the relay")
     pair_host_parser.add_argument("--relay", required=True, help="Relay URL, such as http://100.x.y.z:8778")
-    pair_host_parser.add_argument("--ttl-seconds", default=600, type=int)
+    pair_host_parser.add_argument("--ttl-seconds", default=DEFAULT_TRIAL_INVITE_TTL_SECONDS, type=int)
     pair_host_parser.set_defaults(func=pair_host_command)
     pair_join_parser = pair_subcommands.add_parser("join", help="Join from a GC1 invite and post a signed pairing hello")
     pair_join_parser.add_argument("code")
@@ -561,7 +564,7 @@ def build_parser() -> argparse.ArgumentParser:
     room_subcommands = room_parser.add_subparsers(dest="room_command", required=True)
     room_create = room_subcommands.add_parser("create", help="Create a one-time invite code")
     room_create.add_argument("--relay", default="http://127.0.0.1:8778")
-    room_create.add_argument("--ttl-seconds", default=600, type=int)
+    room_create.add_argument("--ttl-seconds", default=DEFAULT_TRIAL_INVITE_TTL_SECONDS, type=int)
     room_create.set_defaults(func=create_room)
     room_join = room_subcommands.add_parser("join", help="Join a room from a GC1 invite code")
     room_join.add_argument("code")
@@ -629,22 +632,23 @@ def build_parser() -> argparse.ArgumentParser:
     trial_preflight.set_defaults(func=trial_preflight_command)
     trial_host = trial_subcommands.add_parser("host", help="Create a private invite for a live two-machine read-only trial")
     trial_host.add_argument("--relay", required=True, help="Relay URL, such as http://100.x.y.z:8778")
-    trial_host.add_argument("--ttl-seconds", default=600, type=int)
+    trial_host.add_argument("--ttl-seconds", default=DEFAULT_TRIAL_INVITE_TTL_SECONDS, type=int)
     trial_host.set_defaults(func=trial_host_command)
     trial_guest = trial_subcommands.add_parser("guest", help="Join a live two-machine read-only trial from a GC1 invite code")
     trial_guest.add_argument("code")
     trial_guest.set_defaults(func=trial_guest_command)
     trial_host_session = trial_subcommands.add_parser("host-session", help="Run host preflight and create one invite only if needed")
     trial_host_session.add_argument("--relay", required=True, help="Relay URL, such as http://100.x.y.z:8778")
-    trial_host_session.add_argument("--ttl-seconds", default=600, type=int)
+    trial_host_session.add_argument("--ttl-seconds", default=DEFAULT_TRIAL_INVITE_TTL_SECONDS, type=int)
     trial_host_session.set_defaults(func=trial_host_session_command)
     trial_guest_session = trial_subcommands.add_parser("guest-session", help="Run guest preflight and join one invite only if needed")
     trial_guest_session.add_argument("code")
     trial_guest_session.set_defaults(func=trial_guest_session_command)
     trial_prove = trial_subcommands.add_parser("prove", help="Send the read-only proof runbooks and wait for results")
     trial_prove.add_argument("--room-id", default=None)
-    trial_prove.add_argument("--timeout-seconds", default=30.0, type=float)
+    trial_prove.add_argument("--timeout-seconds", default=DEFAULT_LIVE_PROOF_TIMEOUT_SECONDS, type=float)
     trial_prove.add_argument("--interval", default=2.0, type=float)
+    trial_prove.add_argument("--fresh", action="store_true", help="Send a fresh set of proof requests instead of resuming the latest incomplete proof")
     trial_prove.add_argument("--no-report", action="store_true", help="Do not write a redacted proof report")
     trial_prove.set_defaults(func=trial_prove_command)
     trial_listen = trial_subcommands.add_parser("listen", help="Process live trial requests with the read-only lock enforced")

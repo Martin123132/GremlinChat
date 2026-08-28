@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .crypto import create_invite_code, parse_invite_code, protect_secret, safety_phrase, unprotect_secret
+from .crypto import DEFAULT_INVITE_TTL_SECONDS, create_invite_code, parse_invite_code, protect_secret, safety_phrase, unprotect_secret
 from .messages import create_pair_hello
 from .receipts import create_receipt
 from .relay import RelayClient
@@ -21,7 +21,7 @@ def pair_host(
     home: Path,
     *,
     relay_url: str,
-    ttl_seconds: int = 600,
+    ttl_seconds: int = DEFAULT_INVITE_TTL_SECONDS,
     read_only_lock: bool = True,
     allow_existing: bool = False,
 ) -> dict[str, Any]:

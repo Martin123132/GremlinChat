@@ -17,7 +17,7 @@ from .receipts import compare_receipts, create_receipt, receipt_status, write_re
 from .roomops import GremlinChatError, disable_room, process_room_once, request_runbook, revoke_room, sync_room_messages
 from .runbooks import runbook_catalog
 from .store import decide_approval, load_approvals, load_or_create_dashboard_token, load_or_create_identity, load_policy, load_rooms, read_audit_events, save_policy
-from .trial import RESET_CONFIRMATION, build_trial_checklist, reset_local_trial, trial_status, write_trial_bundle
+from .trial import DEFAULT_TRIAL_INVITE_TTL_SECONDS, RESET_CONFIRMATION, build_trial_checklist, reset_local_trial, trial_status, write_trial_bundle
 
 
 def create_daemon_http_server(home: Path, host: str = "127.0.0.1", port: int = 8777) -> ThreadingHTTPServer:
@@ -87,7 +87,7 @@ def create_daemon_http_server(home: Path, host: str = "127.0.0.1", port: int = 8
             if parsed.path == "/api/pair/host":
                 values = _request_values(self, parsed)
                 relay = values.get("relay", [""])[0] or "http://127.0.0.1:8778"
-                ttl_seconds = int(values.get("ttl_seconds", ["600"])[0] or "600")
+                ttl_seconds = int(values.get("ttl_seconds", [str(DEFAULT_TRIAL_INVITE_TTL_SECONDS)])[0] or str(DEFAULT_TRIAL_INVITE_TTL_SECONDS))
                 try:
                     with lock:
                         _action_response(self, parsed, {"ok": True, "pairing": pair_host(home, relay_url=relay, ttl_seconds=ttl_seconds)})
@@ -303,7 +303,7 @@ def _pairing_panel(pairing: dict[str, Any], csrf: str) -> str:
         <form method="post" action="/api/pair/host?redirect=1&csrf={csrf}">
           <strong>Host</strong>
           <input name="relay" value="http://127.0.0.1:8778" aria-label="Relay URL">
-          <input name="ttl_seconds" value="600" aria-label="Invite expiry seconds">
+          <input name="ttl_seconds" value="{DEFAULT_TRIAL_INVITE_TTL_SECONDS}" aria-label="Invite expiry seconds">
           <button>Create Invite</button>
         </form>
         <form method="post" action="/api/pair/join?redirect=1&csrf={csrf}">

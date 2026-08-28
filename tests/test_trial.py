@@ -1,5 +1,6 @@
 import json
 import threading
+import time
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -21,6 +22,7 @@ from gremlinchat.trial import (
     run_guest_session,
     run_host_session,
     run_live_read_only_proof,
+    run_preflight,
     run_trial_simulation,
     write_trial_bundle,
     write_trial_report,
@@ -78,12 +80,16 @@ def test_trial_report_redacts_public_unsafe_values(tmp_path):
             "ok": True,
             "summary": "redaction proof",
             "relay_token": "secret-token",
+            "safety_phrase": "amber-brisk-cobalt-delta",
             "log": "Bearer abcdefghijklmnopqrstuvwxyz123456",
+            "repo_path": str(tmp_path / "private" / "repo"),
         },
     )
 
     assert "secret-token" not in open(paths["json"], encoding="utf-8").read()
     assert "Bearer " not in open(paths["markdown"], encoding="utf-8").read()
+    assert "amber-brisk-cobalt-delta" not in open(paths["json"], encoding="utf-8").read()
+    assert str(tmp_path).replace("\\", "/") not in open(paths["json"], encoding="utf-8").read().replace("\\", "/")
 
 
 def test_live_trial_host_guest_and_proof(tmp_path):
@@ -118,6 +124,59 @@ def test_live_trial_host_guest_and_proof(tmp_path):
     assert all(item["result_accepted"] for item in proof["runbook_results"])
 
 
+def test_live_proof_resumes_late_results_without_duplicate_requests(tmp_path):
+    server = create_relay_http_server(host="127.0.0.1", port=0, state_dir=tmp_path / "relay")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    alice_home = tmp_path / "alice"
+    bob_home = tmp_path / "bob"
+    try:
+        host_packet = create_trial_invite(alice_home, relay_url=f"http://{host}:{port}")
+        guest_packet = accept_trial_invite(bob_home, host_packet["invite_code"])
+        alice_sync = sync_room_messages(alice_home, host_packet["room_id"])
+        verify_room(alice_home, host_packet["room_id"], alice_sync["safety_phrase"])
+        verify_room(bob_home, host_packet["room_id"], guest_packet["safety_phrase"])
+
+        first = run_live_read_only_proof(
+            alice_home,
+            room_id=host_packet["room_id"],
+            timeout_seconds=0,
+            poll_interval=0,
+            write_report=True,
+        )
+        processed = listen_once(bob_home, room_id=host_packet["room_id"])
+        resumed = run_live_read_only_proof(
+            alice_home,
+            room_id=host_packet["room_id"],
+            timeout_seconds=1,
+            poll_interval=0,
+            write_report=True,
+        )
+        next_proof = run_live_read_only_proof(
+            alice_home,
+            room_id=host_packet["room_id"],
+            timeout_seconds=0,
+            poll_interval=0,
+            write_report=False,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert first["ok"] is False
+    assert processed["count"] == 3
+    assert resumed["ok"] is True
+    assert resumed["resumed"] is True
+    assert resumed["resumed_from_report"]
+    assert [item["task_id"] for item in resumed["sent_tasks"]] == [item["task_id"] for item in first["sent_tasks"]]
+    assert resumed["syncs"][-1]["message_count"] == 8
+    assert all(item["result_accepted"] for item in resumed["runbook_results"])
+    assert next_proof["resumed"] is False
+    assert [item["task_id"] for item in next_proof["sent_tasks"]] != [item["task_id"] for item in first["sent_tasks"]]
+
+
 def test_trial_listener_enforces_read_only_lock(tmp_path):
     policy = load_policy(tmp_path)
     policy.trial_read_only_lock = False
@@ -130,6 +189,20 @@ def test_trial_listener_enforces_read_only_lock(tmp_path):
     assert updated.trial_read_only_lock is True
 
 
+def test_trial_preflight_warns_when_home_is_under_localappdata(monkeypatch, tmp_path):
+    localappdata = tmp_path / "localappdata"
+    home = localappdata / "GremlinChat"
+    monkeypatch.setenv("LOCALAPPDATA", str(localappdata))
+
+    report = run_preflight(home)
+    checks = {check["name"]: check for check in report["checks"]}
+
+    assert report["ok"] is True
+    assert checks["home_storage_posture"]["status"] == "warning"
+    assert "under_localappdata" in checks["home_storage_posture"]["detail"]["flags"]
+    assert checks["trial_artifact_storage"]["status"] == "warning"
+
+
 def test_trial_checklist_tracks_role_and_room_states(tmp_path):
     host_empty = build_trial_checklist(tmp_path, role="host", relay_url="http://relay.local:8778")
     guest_empty = build_trial_checklist(tmp_path, role="guest")
@@ -139,15 +212,15 @@ def test_trial_checklist_tracks_role_and_room_states(tmp_path):
     peer = NodeIdentity.generate()
     save_room(_trial_room(peer=peer, verified=False), tmp_path)
     guest_joined = build_trial_checklist(tmp_path, role="guest")
-    assert any(command.startswith("gremlinchat pair verify --phrase") for command in guest_joined["commands"])
+    assert "gremlinchat pair verify --room-id room_trial --phrase amber-brisk-cobalt-delta" in guest_joined["commands"]
 
     room = load_rooms(tmp_path)[0]
     room["verified"] = True
     save_room(room, tmp_path)
     host_verified = build_trial_checklist(tmp_path, role="host")
     guest_verified = build_trial_checklist(tmp_path, role="guest")
-    assert "gremlinchat trial prove" in host_verified["commands"]
-    assert "gremlinchat trial listen" in guest_verified["commands"]
+    assert "gremlinchat trial prove --room-id room_trial" in host_verified["commands"]
+    assert "gremlinchat trial listen --room-id room_trial" in guest_verified["commands"]
 
     policy = load_policy(tmp_path)
     policy.emergency_stop = True
@@ -238,6 +311,7 @@ def test_trial_host_session_creates_one_invite_and_enforces_read_only_lock(tmp_p
     assert first["created_invite"] is True
     assert first["read_only_lock"] == {"trial_read_only_lock": True, "changed": True}
     assert first["invite_packet"]["invite_code"].startswith("GC1:")
+    assert 3500 <= first["invite_packet"]["expires_at"] - time.time() <= 3600
     assert second["ok"] is True
     assert second["created_invite"] is False
     assert second["invite_packet"] is None
