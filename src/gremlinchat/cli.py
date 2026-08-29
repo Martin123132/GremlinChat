@@ -4,8 +4,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import subprocess
+import sys
 import time
+import webbrowser
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import urlopen
 
 from .daemon import create_daemon_http_server
 from .install import run_install_doctor, write_install_doctor_report
@@ -114,6 +120,87 @@ def serve_daemon(args: argparse.Namespace) -> None:
         print("shutting down GremlinChat dashboard")
     finally:
         server.server_close()
+
+
+def open_daemon(args: argparse.Namespace) -> None:
+    home = _home(args.home)
+    load_or_create_identity(home)
+    url = f"http://{args.host}:{args.port}/dashboard"
+    logs_dir = home / "logs"
+    stdout_log = logs_dir / f"dashboard-{args.port}.out.log"
+    stderr_log = logs_dir / f"dashboard-{args.port}.err.log"
+    started = False
+    pid = None
+
+    if not _dashboard_responds(url):
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        command = [
+            sys.executable,
+            "-m",
+            "gremlinchat.cli",
+            "--home",
+            str(home),
+            "daemon",
+            "serve",
+            "--host",
+            args.host,
+            "--port",
+            str(args.port),
+        ]
+        env = os.environ.copy()
+        package_root = str(Path(__file__).resolve().parents[1])
+        env["PYTHONPATH"] = package_root if not env.get("PYTHONPATH") else package_root + os.pathsep + env["PYTHONPATH"]
+        with stdout_log.open("ab") as stdout, stderr_log.open("ab") as stderr:
+            kwargs: dict[str, object] = {
+                "cwd": str(Path.cwd()),
+                "env": env,
+                "stdin": subprocess.DEVNULL,
+                "stdout": stdout,
+                "stderr": stderr,
+            }
+            if os.name == "nt":
+                creationflags = 0
+                for flag_name in ("CREATE_NEW_PROCESS_GROUP", "DETACHED_PROCESS", "CREATE_NO_WINDOW"):
+                    creationflags |= getattr(subprocess, flag_name, 0)
+                if creationflags:
+                    kwargs["creationflags"] = creationflags
+            else:
+                kwargs["start_new_session"] = True
+            process = subprocess.Popen(command, **kwargs)
+        started = True
+        pid = process.pid
+
+        deadline = time.time() + args.wait_seconds
+        while time.time() < deadline and not _dashboard_responds(url):
+            time.sleep(0.2)
+
+    ok = _dashboard_responds(url, timeout_seconds=1.0)
+    browser_opened = False
+    if ok and not args.no_browser:
+        browser_opened = bool(webbrowser.open(url))
+
+    result = {
+        "ok": ok,
+        "url": url,
+        "home": str(home),
+        "started": started,
+        "pid": pid,
+        "browser_opened": browser_opened,
+        "logs": {"stdout": str(stdout_log), "stderr": str(stderr_log)},
+    }
+    print(json.dumps(result, indent=2, sort_keys=True))
+    if not ok:
+        raise SystemExit(1)
+
+
+def _dashboard_responds(url: str, timeout_seconds: float = 0.5) -> bool:
+    try:
+        with urlopen(url, timeout=timeout_seconds) as response:
+            return 200 <= response.status < 500
+    except (HTTPError, TimeoutError):
+        return True
+    except (OSError, URLError):
+        return False
 
 
 def create_room(args: argparse.Namespace) -> None:
@@ -531,6 +618,12 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_serve.add_argument("--host", default="127.0.0.1")
     daemon_serve.add_argument("--port", default=8777, type=int)
     daemon_serve.set_defaults(func=serve_daemon)
+    daemon_open = daemon_subcommands.add_parser("open", help="Start the local dashboard if needed and open it in a browser")
+    daemon_open.add_argument("--host", default="127.0.0.1")
+    daemon_open.add_argument("--port", default=8777, type=int)
+    daemon_open.add_argument("--wait-seconds", default=5.0, type=float)
+    daemon_open.add_argument("--no-browser", action="store_true", help="Start/check the dashboard without opening a browser window")
+    daemon_open.set_defaults(func=open_daemon)
 
     relay_parser = subcommands.add_parser("relay", help="Relay commands")
     relay_subcommands = relay_parser.add_subparsers(dest="relay_command", required=True)

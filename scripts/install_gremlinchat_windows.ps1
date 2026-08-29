@@ -40,8 +40,8 @@ $StateRootForPs = $StateRoot.Replace("'", "''")
 $GremlinExeForPs = $GremlinExe.Replace("'", "''")
 
 $DashboardShortcut = $Shell.CreateShortcut((Join-Path $StartMenu "GremlinChat Dashboard.lnk"))
-$DashboardShortcut.TargetPath = "powershell.exe"
-$DashboardShortcut.Arguments = "-NoExit -ExecutionPolicy Bypass -Command `"`$env:GREMLINCHAT_HOME='$StateRootForPs'; & '$GremlinExeForPs' --home '$StateRootForPs' daemon serve`""
+$DashboardShortcut.TargetPath = $GremlinExe
+$DashboardShortcut.Arguments = "--home `"$StateRoot`" daemon open"
 $DashboardShortcut.WorkingDirectory = $RepoRoot
 $DashboardShortcut.Save()
 

@@ -1,5 +1,9 @@
 import json
+import threading
+from argparse import Namespace
 
+from gremlinchat.cli import open_daemon
+from gremlinchat.daemon import create_daemon_http_server
 from gremlinchat.install import run_install_doctor, write_install_doctor_report
 from gremlinchat.store import default_home, load_or_create_identity
 
@@ -53,3 +57,22 @@ def test_install_doctor_warns_when_home_is_under_localappdata(monkeypatch, tmp_p
     assert checks["home_storage_posture"]["status"] == "warning"
     assert "under_localappdata" in checks["home_storage_posture"]["detail"]["flags"]
     assert checks["artifact_storage_posture"]["status"] == "warning"
+
+
+def test_daemon_open_reports_existing_dashboard_without_browser(tmp_path, capsys):
+    server = create_daemon_http_server(tmp_path, host="127.0.0.1", port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    try:
+        open_daemon(Namespace(home=str(tmp_path), host=host, port=port, wait_seconds=1.0, no_browser=True))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["ok"] is True
+    assert result["started"] is False
+    assert result["browser_opened"] is False
+    assert result["url"] == f"http://{host}:{port}/dashboard"

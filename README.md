@@ -183,7 +183,7 @@ gremlinchat --home D:\GremlinChat\state room revoke
 Open the local dashboard:
 
 ```powershell
-gremlinchat --home D:\GremlinChat\state daemon serve
+gremlinchat --home D:\GremlinChat\state daemon open
 ```
 
 Dashboard URL:
@@ -265,6 +265,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install_gremlinchat_windows.p
 ```
 
 The installer creates Start Menu shortcuts for Dashboard, Trial Listener, Preflight, Install Doctor, and Emergency Stop. Windows stores those shortcuts under `%APPDATA%`, but the shortcut targets can point at the D-drive venv and pass `--home D:\GremlinChat\state`. The installer then runs:
+
+The Dashboard shortcut starts the local dashboard daemon if needed and then opens `http://127.0.0.1:8777/dashboard`.
 
 ```powershell
 gremlinchat --home D:\GremlinChat\state install doctor --write-report
