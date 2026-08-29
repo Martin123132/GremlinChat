@@ -98,7 +98,7 @@ Host starts a guided session. This runs preflight, keeps the read-only lock on, 
 gremlinchat --home D:\GremlinChat\state trial host-session --relay http://YOUR_LAN_OR_TAILSCALE_IP:8778
 ```
 
-Trial invites default to one hour. They still expire, but the longer window is friendlier for first-run setup while both people compare the safety phrase out of band before enabling the room.
+Trial invites default to one hour. They still expire, but the longer window is friendlier for first-run setup while both people compare the safety phrase out of band before enabling the room. Invite expiry blocks unpaired or third-party joins; it does not kill an already locked two-person relay room.
 
 Guest starts a guided session with the invite code shared privately. This runs preflight, keeps the read-only lock on, and refuses to join a second room if one already exists:
 

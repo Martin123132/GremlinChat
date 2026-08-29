@@ -1,6 +1,7 @@
 import shutil
 import subprocess
 import threading
+import time
 
 import pytest
 
@@ -91,6 +92,43 @@ def test_relay_rejects_room_message_flood():
     assert relay.append_envelope(room.room_id, room.token, first)["accepted"]
     with pytest.raises(PermissionError, match="message limit"):
         relay.append_envelope(room.room_id, room.token, second)
+
+
+def test_relay_allows_locked_room_after_invite_expiry_but_blocks_new_participant():
+    relay = GremlinRelay()
+    room = relay.create_room(ttl_seconds=60)
+    alice = NodeIdentity.generate()
+    bob = NodeIdentity.generate()
+    eve = NodeIdentity.generate()
+    for sender in [alice, bob]:
+        envelope = _envelope(sender)
+        envelope["room_id"] = room.room_id
+        assert relay.append_envelope(room.room_id, room.token, envelope)["accepted"]
+    assert room.locked is True
+
+    room.expires_at = time.time() - 1
+    alice_late = _envelope(alice)
+    alice_late["room_id"] = room.room_id
+    alice_late["message_id"] = "msg_late_alice"
+    assert relay.append_envelope(room.room_id, room.token, alice_late)["accepted"]
+    assert len(relay.messages_after(room.room_id, room.token)["messages"]) == 3
+
+    eve_late = _envelope(eve)
+    eve_late["room_id"] = room.room_id
+    with pytest.raises(PermissionError, match="expired|locked"):
+        relay.append_envelope(room.room_id, room.token, eve_late)
+
+
+def test_relay_rejects_expired_unlocked_room():
+    relay = GremlinRelay()
+    room = relay.create_room(ttl_seconds=60)
+    room.expires_at = time.time() - 1
+    alice = NodeIdentity.generate()
+    envelope = _envelope(alice)
+    envelope["room_id"] = room.room_id
+
+    with pytest.raises(PermissionError, match="room expired"):
+        relay.append_envelope(room.room_id, room.token, envelope)
 
 
 def test_relay_rejects_oversized_request_body():

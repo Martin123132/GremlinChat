@@ -56,21 +56,23 @@ class GremlinRelay:
         self._persist_room(room)
         return room
 
-    def get_room(self, room_id: str, token: str) -> RelayRoom:
+    def get_room(self, room_id: str, token: str, *, allow_expired_locked: bool = False) -> RelayRoom:
         room = self.rooms.get(room_id)
         if room is None:
             raise PermissionError("room not found")
         if room.token != token:
             raise PermissionError("relay token rejected")
-        if room.expires_at < time.time():
+        if room.expires_at < time.time() and not (allow_expired_locked and room.locked):
             raise PermissionError("room expired")
         return room
 
     def append_envelope(self, room_id: str, token: str, envelope: dict[str, Any]) -> dict[str, Any]:
-        room = self.get_room(room_id, token)
+        room = self.get_room(room_id, token, allow_expired_locked=True)
         sender = str(envelope.get("sender_node_id", ""))
         if not sender:
             raise ValueError("envelope missing sender_node_id")
+        if room.expires_at < time.time() and (not room.locked or sender not in room.participants):
+            raise PermissionError("room expired")
         envelope_size = len(json.dumps(envelope, sort_keys=True).encode("utf-8"))
         if envelope_size > self.max_envelope_bytes:
             raise RelayPayloadTooLarge(f"envelope exceeds {self.max_envelope_bytes} bytes")
@@ -89,7 +91,7 @@ class GremlinRelay:
         return {"accepted": True, "index": index, "locked": room.locked}
 
     def messages_after(self, room_id: str, token: str, after: int = -1) -> dict[str, Any]:
-        room = self.get_room(room_id, token)
+        room = self.get_room(room_id, token, allow_expired_locked=True)
         return {
             "room_id": room.room_id,
             "locked": room.locked,
