@@ -13,6 +13,14 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
+from .cobuild import (
+    COBUILD_READ_RUNBOOKS,
+    add_project_card,
+    cobuild_status,
+    load_project_cards,
+    remove_project_card,
+    write_cobuild_handoff_packet,
+)
 from .daemon import create_daemon_http_server
 from .install import run_install_doctor, write_install_doctor_report
 from .pairing import pair_host, pair_join, pair_status, pair_verify
@@ -540,6 +548,53 @@ def trial_report_command(args: argparse.Namespace) -> None:
     print(json.dumps({"report_paths": paths}, indent=2, sort_keys=True))
 
 
+def cobuild_status_command(args: argparse.Namespace) -> None:
+    print(json.dumps(cobuild_status(_home(args.home)), indent=2, sort_keys=True))
+
+
+def cobuild_project_list_command(args: argparse.Namespace) -> None:
+    projects = load_project_cards(_home(args.home))
+    print(json.dumps({"schema": "gremlinchat.cobuild-project-list.v1", "projects": projects}, indent=2, sort_keys=True))
+
+
+def cobuild_project_add_command(args: argparse.Namespace) -> None:
+    try:
+        result = add_project_card(
+            _home(args.home),
+            alias=args.alias,
+            path=args.path,
+            description=args.description,
+            diagnostic_files=args.diagnostic_file,
+        )
+    except (OSError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def cobuild_project_remove_command(args: argparse.Namespace) -> None:
+    try:
+        result = remove_project_card(_home(args.home), alias=args.alias)
+    except (KeyError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def cobuild_request_command(args: argparse.Namespace) -> None:
+    payload = {"project": args.project, "question": args.question or ""}
+    try:
+        print(json.dumps(send_runbook_request(_home(args.home), args.room_id, args.runbook, payload), indent=2, sort_keys=True))
+    except GremlinChatError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def cobuild_handoff_command(args: argparse.Namespace) -> None:
+    try:
+        paths = write_cobuild_handoff_packet(_home(args.home), room_id=args.room_id, task_id=args.task_id, question=args.question)
+    except (FileNotFoundError, OSError) as exc:
+        raise SystemExit(str(exc)) from exc
+    print(json.dumps({"handoff_paths": paths}, indent=2, sort_keys=True))
+
+
 def _load_room(home: Path, room_id: str | None) -> dict:
     try:
         return load_room_state(home, room_id)
@@ -766,6 +821,34 @@ def build_parser() -> argparse.ArgumentParser:
     trial_report = trial_subcommands.add_parser("report", help="Write a redacted local trial report")
     trial_report.add_argument("--summary-json", default=None, help="Optional JSON summary to write instead of a live local snapshot")
     trial_report.set_defaults(func=trial_report_command)
+
+    cobuild_parser = subcommands.add_parser("cobuild", help="Co-Build Mode commands for project aliases and Codex handoffs")
+    cobuild_subcommands = cobuild_parser.add_subparsers(dest="cobuild_command", required=True)
+    cobuild_subcommands.add_parser("status", help="Show local co-build projects, runbooks, and recent timeline").set_defaults(func=cobuild_status_command)
+    cobuild_request = cobuild_subcommands.add_parser("request", help="Request a read-only co-build diagnostic from a verified room")
+    cobuild_request.add_argument("--room-id", default=None)
+    cobuild_request.add_argument("--project", required=True, help="Partner's local project alias, not a filesystem path")
+    cobuild_request.add_argument("--question", default="", help="Short debugging question for the partner's Codex")
+    cobuild_request.add_argument("--runbook", default="project.bundle", choices=sorted(COBUILD_READ_RUNBOOKS))
+    cobuild_request.set_defaults(func=cobuild_request_command)
+    cobuild_handoff = cobuild_subcommands.add_parser("handoff", help="Write a Codex-ready handoff packet from the latest co-build result")
+    cobuild_handoff.add_argument("--room-id", default=None)
+    cobuild_handoff.add_argument("--task-id", default=None)
+    cobuild_handoff.add_argument("--question", default=None)
+    cobuild_handoff.set_defaults(func=cobuild_handoff_command)
+
+    cobuild_project = cobuild_subcommands.add_parser("project", help="Manage local private project aliases")
+    cobuild_project_subcommands = cobuild_project.add_subparsers(dest="cobuild_project_command", required=True)
+    cobuild_project_subcommands.add_parser("list", help="List local co-build project aliases").set_defaults(func=cobuild_project_list_command)
+    cobuild_project_add = cobuild_project_subcommands.add_parser("add", help="Register a local project alias for read-only co-build diagnostics")
+    cobuild_project_add.add_argument("--alias", required=True)
+    cobuild_project_add.add_argument("--path", required=True)
+    cobuild_project_add.add_argument("--description", default="")
+    cobuild_project_add.add_argument("--diagnostic-file", action="append", default=None, help="Relative diagnostic file to include in project.errors")
+    cobuild_project_add.set_defaults(func=cobuild_project_add_command)
+    cobuild_project_remove = cobuild_project_subcommands.add_parser("remove", help="Remove a local co-build project alias")
+    cobuild_project_remove.add_argument("--alias", required=True)
+    cobuild_project_remove.set_defaults(func=cobuild_project_remove_command)
     return parser
 
 

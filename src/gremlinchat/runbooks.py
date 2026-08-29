@@ -12,10 +12,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .cobuild import COBUILD_READ_RUNBOOKS, run_project_runbook
 from .redaction import redact_value
 from .store import ApprovedRepo, RunbookPolicy, append_audit_event
 
-READ_RUNBOOKS = {"presence.ping", "machine.status", "repo.status", "worker.status", "gremlinchat.doctor"}
+READ_RUNBOOKS = {"presence.ping", "machine.status", "repo.status", "worker.status", "gremlinchat.doctor"} | COBUILD_READ_RUNBOOKS
 WRITE_RUNBOOKS = {"repo.pull_ff_only", "worker.restart_named", "tests.run_allowlisted"}
 ALL_RUNBOOKS = READ_RUNBOOKS | WRITE_RUNBOOKS
 
@@ -112,6 +113,9 @@ def execute_runbook(
         if runbook == "gremlinchat.doctor":
             output = _doctor_report(home)
             return _result(True, runbook, "completed", "GremlinChat doctor completed.", output, started_at, home)
+        if runbook in COBUILD_READ_RUNBOOKS:
+            output = run_project_runbook(home, runbook, payload)
+            return _result(True, runbook, "completed", str(output.get("summary") or "Co-build project diagnostics collected."), output, started_at, home)
         if runbook == "repo.pull_ff_only":
             repo = _approved_repo(payload, policy)
             if not approval_override and not repo.allow_pull_ff_only:

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
 
+from .cobuild import COBUILD_READ_RUNBOOKS, add_project_card, cobuild_status, remove_project_card, write_cobuild_handoff_packet
 from .pairing import pair_host, pair_join, pair_status, pair_verify
 from .receipts import compare_receipts, create_receipt, receipt_status, write_receipt_bundle
 from .roomops import GremlinChatError, disable_room, process_room_once, request_runbook, revoke_room, sync_room_messages
@@ -63,6 +64,10 @@ def create_daemon_http_server(home: Path, host: str = "127.0.0.1", port: int = 8
                 query = parse_qs(parsed.query)
                 with lock:
                     _json_response(self, 200, compare_receipts(home, room_id=query.get("room_id", [None])[0]))
+                return
+            if parsed.path == "/api/cobuild/status":
+                with lock:
+                    _json_response(self, 200, cobuild_status(home))
                 return
             _json_response(self, 404, {"error": "not found"})
 
@@ -127,6 +132,58 @@ def create_daemon_http_server(home: Path, host: str = "127.0.0.1", port: int = 8
                 except GremlinChatError as exc:
                     _json_response(self, 400, {"ok": False, "error": str(exc), "required_confirm": RESET_CONFIRMATION})
                 return
+            if parsed.path == "/api/cobuild/project/add":
+                values = _request_values(self, parsed)
+                try:
+                    with lock:
+                        payload = add_project_card(
+                            home,
+                            alias=values.get("alias", [""])[0],
+                            path=values.get("path", [""])[0],
+                            description=values.get("description", [""])[0],
+                            diagnostic_files=values.get("diagnostic_file") or None,
+                        )
+                        _action_response(self, parsed, payload)
+                except (OSError, ValueError) as exc:
+                    _json_response(self, 400, {"ok": False, "error": str(exc)})
+                return
+            if parsed.path == "/api/cobuild/project/remove":
+                values = _request_values(self, parsed)
+                alias = values.get("alias", [""])[0]
+                try:
+                    with lock:
+                        _action_response(self, parsed, remove_project_card(home, alias=alias))
+                except (KeyError, ValueError) as exc:
+                    _json_response(self, 400, {"ok": False, "error": str(exc)})
+                return
+            if parsed.path == "/api/cobuild/request":
+                values = _request_values(self, parsed)
+                room_id = values.get("room_id", [""])[0] or None
+                runbook = values.get("runbook", ["project.bundle"])[0] or "project.bundle"
+                if runbook not in COBUILD_READ_RUNBOOKS:
+                    _json_response(self, 400, {"ok": False, "error": "co-build dashboard only sends read-only project diagnostics"})
+                    return
+                payload = {"project": values.get("project", [""])[0], "question": values.get("question", [""])[0]}
+                try:
+                    with lock:
+                        _action_response(self, parsed, {"ok": True, "request": request_runbook(home, room_id, runbook, payload)})
+                except GremlinChatError as exc:
+                    _json_response(self, 400, {"ok": False, "error": str(exc)})
+                return
+            if parsed.path == "/api/cobuild/handoff":
+                values = _request_values(self, parsed)
+                try:
+                    with lock:
+                        paths = write_cobuild_handoff_packet(
+                            home,
+                            room_id=values.get("room_id", [""])[0] or None,
+                            task_id=values.get("task_id", [""])[0] or None,
+                            question=values.get("question", [""])[0] or None,
+                        )
+                        _action_response(self, parsed, {"ok": True, "handoff_paths": paths})
+                except (FileNotFoundError, OSError) as exc:
+                    _json_response(self, 400, {"ok": False, "error": str(exc)})
+                return
             if parsed.path in {"/api/rooms/sync", "/api/rooms/request", "/api/rooms/disable", "/api/rooms/revoke"}:
                 room_id = parse_qs(parsed.query).get("room_id", [""])[0] or None
                 try:
@@ -138,11 +195,15 @@ def create_daemon_http_server(home: Path, host: str = "127.0.0.1", port: int = 8
                             except GremlinChatError as exc:
                                 payload["process_error"] = str(exc)
                         elif parsed.path == "/api/rooms/request":
-                            runbook = parse_qs(parsed.query).get("runbook", [""])[0]
-                            if runbook not in {"presence.ping", "gremlinchat.doctor"}:
-                                _json_response(self, 400, {"ok": False, "error": "dashboard only sends read-only ping and doctor requests"})
+                            values = _request_values(self, parsed)
+                            runbook = values.get("runbook", [""])[0]
+                            if runbook not in {"presence.ping", "gremlinchat.doctor"} | COBUILD_READ_RUNBOOKS:
+                                _json_response(self, 400, {"ok": False, "error": "dashboard only sends read-only ping, doctor, and co-build project requests"})
                                 return
-                            payload = {"ok": True, "request": request_runbook(home, room_id, runbook, {})}
+                            request_payload = {}
+                            if runbook in COBUILD_READ_RUNBOOKS:
+                                request_payload = {"project": values.get("project", [""])[0], "question": values.get("question", [""])[0]}
+                            payload = {"ok": True, "request": request_runbook(home, room_id, runbook, request_payload)}
                         elif parsed.path == "/api/rooms/disable":
                             payload = {"ok": True, "disable": disable_room(home, room_id)}
                         else:
@@ -185,6 +246,7 @@ def _snapshot(home: Path, *, include_csrf: bool = False) -> dict[str, Any]:
         "pairing": pair_status(home, include_invite=include_csrf),
         "trial": trial_status(home),
         "receipts": receipt_status(home),
+        "cobuild": cobuild_status(home),
     }
     if include_csrf:
         snapshot["csrf_token"] = load_or_create_dashboard_token(home)
@@ -212,6 +274,10 @@ def _render_dashboard(snapshot: dict[str, Any]) -> str:
     trial_rows = _trial_rows(trial)
     receipt_rows = _receipt_rows(snapshot["receipts"])
     receipt_compare_rows = _receipt_compare_rows(snapshot["receipts"].get("compare", {}))
+    cobuild = snapshot["cobuild"]
+    cobuild_project_rows = _cobuild_project_rows(cobuild, csrf)
+    cobuild_timeline_rows = _cobuild_timeline_rows(cobuild)
+    cobuild_request_panel = _cobuild_request_panel(snapshot["rooms"], cobuild, csrf)
     approval_rows = "\n".join(
         f"<tr><td><code>{html.escape(str(approval.get('approval_id', '')))}</code></td><td>{html.escape(str(approval.get('runbook', '')))}</td><td>{html.escape(str(approval.get('reason', '')))}</td><td><form method=\"post\" action=\"/api/approvals/approve?approval_id={quote(str(approval.get('approval_id', '')), safe='')}&redirect=1&csrf={csrf}\"><button>Approve</button></form><form method=\"post\" action=\"/api/approvals/reject?approval_id={quote(str(approval.get('approval_id', '')), safe='')}&redirect=1&csrf={csrf}\"><button>Reject</button></form></td></tr>"
         for approval in pending
@@ -264,11 +330,13 @@ def _render_dashboard(snapshot: dict[str, Any]) -> str:
       <div class="metric"><span>Emergency Stop</span><strong><span class="state">{html.escape(emergency)}</span></strong><form method="post" action="/api/emergency-stop?redirect=1&csrf={csrf}"><button>Emergency Stop</button></form></div>
       <div class="metric"><span>Rooms</span><strong>{len(snapshot["rooms"])}</strong></div>
       <div class="metric"><span>Trust Receipts</span><strong>{snapshot["receipts"].get("count", 0)}</strong></div>
+      <div class="metric"><span>Co-Build Projects</span><strong>{cobuild.get("project_count", 0)}</strong></div>
       <div class="metric"><span>Pending Approvals</span><strong>{len(pending)}</strong></div>
       <div class="metric"><span>Write Runbooks</span><strong>{len(policy["enabled_write_runbooks"])}</strong></div>
     </div>
     <section><h2>Pairing Ceremony</h2>{pairing_panel}</section>
     <section><h2>Trial</h2><table><thead><tr><th>Check</th><th>Status</th><th>Detail</th></tr></thead><tbody>{trial_rows}</tbody></table><div class="actions"><a href="/api/trial/checklist?role=host">Checklist</a><form method="post" action="/api/trial/bundle?redirect=1&csrf={csrf}"><button>Bundle</button></form><form method="post" action="/api/emergency-stop?redirect=1&csrf={csrf}"><button>Emergency Stop</button></form></div></section>
+    <section><h2>Co-Build</h2>{cobuild_request_panel}<table><thead><tr><th>Alias</th><th>Path</th><th>Diagnostics</th><th>Actions</th></tr></thead><tbody>{cobuild_project_rows}</tbody></table><div class="actions"><a href="/api/cobuild/status">Status</a><form method="post" action="/api/cobuild/handoff?redirect=1&csrf={csrf}"><button>Handoff Packet</button></form></div><table><thead><tr><th>Time</th><th>Kind</th><th>Runbook</th><th>Summary</th></tr></thead><tbody>{cobuild_timeline_rows}</tbody></table></section>
     <section><h2>Trust Receipts</h2><table><thead><tr><th>Receipt</th><th>Source</th><th>Issuer</th><th>Event</th><th>Status</th></tr></thead><tbody>{receipt_rows}</tbody></table><div class="actions"><a href="/api/receipts/status">Status</a><a href="/api/receipts/compare">Compare</a><form method="post" action="/api/receipts/bundle?redirect=1&csrf={csrf}"><button>Bundle</button></form></div><table><thead><tr><th>Comparison</th><th>Count</th><th>Meaning</th></tr></thead><tbody>{receipt_compare_rows}</tbody></table></section>
     <section><h2>Rooms</h2><table><thead><tr><th>Room</th><th>Relay</th><th>Partner</th><th>State</th><th>Safety Phrase</th><th>Actions</th></tr></thead><tbody>{room_rows}</tbody></table></section>
     <section><h2>Pending Approvals</h2><table><thead><tr><th>Approval</th><th>Runbook</th><th>Reason</th><th>Decision</th></tr></thead><tbody>{approval_rows}</tbody></table></section>
@@ -316,6 +384,75 @@ def _pairing_panel(pairing: dict[str, Any], csrf: str) -> str:
       <table><thead><tr><th>Room</th><th>Role</th><th>State</th><th>Safety Phrase</th></tr></thead><tbody>{state_rows}</tbody></table>
       <div class="actions"><a href="/api/pair/status">Pair Status</a><a href="/api/trial/checklist?role=host">Host Checklist</a><a href="/api/trial/checklist?role=guest">Guest Checklist</a></div>
     """
+
+
+def _cobuild_request_panel(rooms: list[dict[str, Any]], cobuild: dict[str, Any], csrf: str) -> str:
+    room_value = ""
+    for room in rooms:
+        if room.get("verified") and not room.get("disabled"):
+            room_value = str(room.get("room_id", ""))
+            break
+    runbook_options = "".join(
+        f"<option value=\"{html.escape(runbook)}\"{' selected' if runbook == 'project.bundle' else ''}>{html.escape(runbook)}</option>"
+        for runbook in sorted(COBUILD_READ_RUNBOOKS)
+    )
+    return f"""
+      <div class="pair-grid">
+        <form method="post" action="/api/cobuild/project/add?redirect=1&csrf={csrf}">
+          <strong>Register Local Project</strong>
+          <input name="alias" placeholder="project-alias" aria-label="Project alias">
+          <input name="path" placeholder="D:\\Projects\\SomeProject" aria-label="Local project path">
+          <input name="description" placeholder="Short private note" aria-label="Project description">
+          <button>Add Project Alias</button>
+        </form>
+        <form method="post" action="/api/cobuild/request?redirect=1&csrf={csrf}">
+          <strong>Ask Partner Project</strong>
+          <input name="room_id" value="{html.escape(room_value)}" placeholder="room_..." aria-label="Room ID">
+          <input name="project" placeholder="partner-project-alias" aria-label="Partner project alias">
+          <select name="runbook" aria-label="Co-build runbook">{runbook_options}</select>
+          <input name="question" placeholder="What should Codex help diagnose?" aria-label="Question">
+          <button>Request Read-Only Packet</button>
+        </form>
+        <form method="post" action="/api/cobuild/handoff?redirect=1&csrf={csrf}">
+          <strong>Write Handoff</strong>
+          <input name="room_id" value="{html.escape(room_value)}" placeholder="optional room_..." aria-label="Room ID">
+          <input name="task_id" placeholder="optional task_..." aria-label="Task ID">
+          <input name="question" placeholder="Codex focus question" aria-label="Question">
+          <button>Write Codex Packet</button>
+        </form>
+      </div>
+      <div class="hint">Project aliases are local consent handles. Partners ask for an alias; your machine resolves the real path privately.</div>
+    """
+
+
+def _cobuild_project_rows(cobuild: dict[str, Any], csrf: str) -> str:
+    projects = cobuild.get("projects", [])
+    if not projects:
+        return "<tr><td colspan=\"4\" class=\"empty\">No local co-build project aliases yet.</td></tr>"
+    rows = []
+    for project in projects:
+        alias = str(project.get("alias", ""))
+        diagnostic_files = ", ".join(str(item) for item in project.get("diagnostic_files", []))
+        rows.append(
+            f"<tr><td><code>{html.escape(alias)}</code><div class=\"hint\">{html.escape(str(project.get('description', '')))}</div></td>"
+            f"<td>{html.escape(str(project.get('path', '')))}</td>"
+            f"<td>{html.escape(diagnostic_files)}</td>"
+            f"<td><form method=\"post\" action=\"/api/cobuild/project/remove?redirect=1&csrf={csrf}\"><input type=\"hidden\" name=\"alias\" value=\"{html.escape(alias)}\"><button>Remove</button></form></td></tr>"
+        )
+    return "\n".join(rows)
+
+
+def _cobuild_timeline_rows(cobuild: dict[str, Any]) -> str:
+    rows = cobuild.get("timeline", [])
+    if not rows:
+        return "<tr><td colspan=\"4\" class=\"empty\">No co-build activity yet.</td></tr>"
+    return "\n".join(
+        f"<tr><td>{html.escape(str(item.get('created_at', '')))}</td>"
+        f"<td>{html.escape(str(item.get('kind', '')))}</td>"
+        f"<td><code>{html.escape(str(item.get('runbook', '')))}</code></td>"
+        f"<td>{html.escape(str(item.get('summary', '')))}</td></tr>"
+        for item in rows
+    )
 
 
 def _trial_rows(trial: dict[str, Any]) -> str:

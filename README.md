@@ -168,6 +168,69 @@ gremlinchat --home D:\GremlinChat\state receipt bundle
 
 Trust Receipts prove that a local GremlinChat node signed a redacted event record and that the file has not been altered. They do not prove that the signing node is trusted; you still compare the pairing safety phrase out of band.
 
+## Co-Build Mode
+
+Co-Build Mode is the first slice for using GremlinChat with a real partner project. It keeps the same safety model:
+
+- no arbitrary shell
+- no silent edits
+- no direct Codex account control
+- partner requests use a local project alias, not a filesystem path
+- project diagnostics are read-only, bounded, and redacted before reports or handoff packets are written
+
+On the machine that owns the project, register a private alias:
+
+```powershell
+gremlinchat --home D:\GremlinChat\state cobuild project add --alias glyns-broken-app --path D:\Projects\BrokenApp --description "startup issue"
+```
+
+That alias is the only project identifier the partner needs. The real path stays local to the owner machine.
+
+GremlinChat reads these owner-controlled diagnostic files when present:
+
+```text
+GREMLINCHAT_ERRORS.md
+GREMLINCHAT_DIAGNOSTICS.md
+.gremlinchat/errors.txt
+.gremlinchat/diagnostics.md
+```
+
+The project owner or their local Codex can write a short error note into one of those files before a co-build request. GremlinChat does not scrape arbitrary logs by default.
+
+List local project aliases:
+
+```powershell
+gremlinchat --home D:\GremlinChat\state cobuild project list
+gremlinchat --home D:\GremlinChat\state cobuild status
+```
+
+Ask the partner machine for a read-only project packet:
+
+```powershell
+gremlinchat --home D:\GremlinChat\state cobuild request --room-id room_... --project glyns-broken-app --question "Find the startup blocker."
+```
+
+The partner keeps the listener running:
+
+```powershell
+gremlinchat --home D:\GremlinChat\state trial listen --room-id room_...
+```
+
+After the listener replies, sync and write a Codex-ready handoff packet:
+
+```powershell
+gremlinchat --home D:\GremlinChat\state room sync --room-id room_...
+gremlinchat --home D:\GremlinChat\state cobuild handoff --room-id room_...
+```
+
+The handoff packet is written under:
+
+```text
+D:\GremlinChat\state\reports\cobuild-handoff-*.md
+```
+
+Dashboard Co-Build controls can register a local project alias, request a partner project packet, write a handoff packet, and show the recent co-build timeline.
+
 Clear local trial rooms, approvals, and reports for a fresh attempt while preserving this machine's identity and revoked peers:
 
 ```powershell

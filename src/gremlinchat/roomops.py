@@ -10,7 +10,7 @@ from .crypto import EncryptedEnvelope, ReplayGuard, derive_room_key, open_messag
 from .messages import create_task_request, create_task_result, verify_pair_hello
 from .receipts import create_receipt
 from .relay import RelayClient
-from .runbooks import ALL_RUNBOOKS, WRITE_RUNBOOKS, check_runbook_approval, execute_runbook
+from .runbooks import ALL_RUNBOOKS, COBUILD_READ_RUNBOOKS, WRITE_RUNBOOKS, check_runbook_approval, execute_runbook
 from .store import (
     approval_for_task,
     append_audit_event,
@@ -88,7 +88,8 @@ def sync_room_messages(home: Path, room_id: str | None) -> dict[str, Any]:
         try:
             message = open_message(envelope=EncryptedEnvelope.from_dict(envelope), room_key=room_key(room, identity, x25519_identity), replay_guard=ReplayGuard())
             if message.get("type") == "task.result.v1":
-                message["report_paths"] = write_task_report(home, message)
+                report_payload = {"direction": "incoming", "room_id": room["room_id"], **message}
+                message["report_paths"] = write_task_report(home, report_payload)
                 result = dict(message.get("result", {}))
                 create_receipt(
                     home,
@@ -106,6 +107,23 @@ def sync_room_messages(home: Path, room_id: str | None) -> dict[str, Any]:
                         "report_paths": message["report_paths"],
                     },
                 )
+                if str(message.get("runbook", "")) in COBUILD_READ_RUNBOOKS:
+                    create_receipt(
+                        home,
+                        event_type="cobuild.task.result",
+                        status=str(result.get("status", "received")),
+                        room_id=room["room_id"],
+                        task_id=str(message.get("task_id", "")),
+                        runbook=str(message.get("runbook", "")),
+                        dedupe_key=f"cobuild.incoming:{message.get('task_id')}",
+                        evidence={
+                            "direction": "incoming",
+                            "peer_node_id": envelope.get("sender_node_id"),
+                            "accepted": bool(result.get("accepted", False)),
+                            "summary": result.get("summary", ""),
+                            "report_paths": message["report_paths"],
+                        },
+                    )
             decrypted.append(message)
         except ValueError as exc:
             decrypted.append({"type": "message.error", "error": str(exc)})
@@ -217,6 +235,17 @@ def request_runbook(home: Path, room_id: str | None, runbook: str, payload: dict
         dedupe_key=f"task.requested:{request['task_id']}",
         evidence={"peer_node_id": room.get("peer_node_id"), "relay_response": response},
     )
+    if runbook in COBUILD_READ_RUNBOOKS:
+        create_receipt(
+            home,
+            event_type="cobuild.task.requested",
+            status="accepted" if response.get("accepted") else "relay_rejected",
+            room_id=room["room_id"],
+            task_id=request["task_id"],
+            runbook=runbook,
+            dedupe_key=f"cobuild.task.requested:{request['task_id']}",
+            evidence={"peer_node_id": room.get("peer_node_id"), "project": ({} if payload is None else payload).get("project"), "relay_response": response},
+        )
     return {"task_id": request["task_id"], "relay_response": response}
 
 
@@ -259,7 +288,7 @@ def process_room_once(home: Path, room_id: str | None) -> dict[str, Any]:
         relay_response = RelayClient(room["relay_url"]).post_envelope(room_id=room["room_id"], relay_token=room["relay_token"], envelope=reply_envelope.to_dict())
         if existing_approval:
             mark_approval_consumed(home, str(existing_approval["approval_id"]))
-        report_paths = write_task_report(home, {"direction": "outgoing", "task_id": message["task_id"], "runbook": runbook, "result": result_dict, "relay_response": relay_response})
+        report_paths = write_task_report(home, {"direction": "outgoing", "room_id": room["room_id"], "task_id": message["task_id"], "runbook": runbook, "result": result_dict, "relay_response": relay_response})
         create_receipt(
             home,
             event_type="task.result",
@@ -277,6 +306,23 @@ def process_room_once(home: Path, room_id: str | None) -> dict[str, Any]:
                 "report_paths": report_paths,
             },
         )
+        if runbook in COBUILD_READ_RUNBOOKS:
+            create_receipt(
+                home,
+                event_type="cobuild.task.result",
+                status=str(result_dict.get("status", "returned")),
+                room_id=room["room_id"],
+                task_id=str(message["task_id"]),
+                runbook=runbook,
+                dedupe_key=f"cobuild.outgoing:{message['task_id']}",
+                evidence={
+                    "direction": "outgoing",
+                    "requester_node_id": requester_node_id,
+                    "accepted": bool(result_dict.get("accepted", False)),
+                    "summary": result_dict.get("summary", ""),
+                    "report_paths": report_paths,
+                },
+            )
         processed.add(str(message_id))
         replies.append({"task_id": message["task_id"], "runbook": runbook, "relay_response": relay_response, "report_paths": report_paths})
     room["processed_message_ids"] = sorted(processed)
